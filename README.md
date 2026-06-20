@@ -123,6 +123,36 @@ boundaries after the change.
 
 ---
 
+## Visualize Flows (Diagrams)
+
+The belief map already stores `imports`, `calls`, `data-flow`, and `refs` edges, so an agent can render **code-flow, data-flow, and sequence diagrams straight from facts** -- not guessed from reading source. This is the fastest way to see the skill's power: ask for a diagram and the agent queries the graph, then emits Mermaid (renders natively on GitHub).
+
+**Sequence diagram (from a call chain):**
+```
+Use the codespaces skill to draw a sequence diagram for file upload.
+1. find_callchain handleUpload create 5   # trace the call path
+2. flow drive_api handleUpload            # expand call/data flow
+Render the result as a Mermaid sequenceDiagram, one participant per module.
+```
+
+**Code-flow / call graph (flowchart):**
+```
+Use the codespaces skill to draw the call flow around OperativesService.
+Run: analyze operatives.service ; deps operatives.service 2
+Render a Mermaid flowchart LR -- one node per module, edges = imports/calls.
+```
+
+**Data-flow diagram:**
+```
+Use the codespaces skill to draw the data flow for DrivePath.
+Query: rg 'data-flow' .belief_map.sexp ; then refs-to "DrivePath"
+Render a Mermaid flowchart showing where data is produced -> validated -> consumed.
+```
+
+Tip: build the map with `--lsp` first (`python3 scripts/build_belief_map.py --lsp`) for precise call-site edges -- sequence diagrams come out much sharper.
+
+---
+
 ## Skill Structure
 
 ```
