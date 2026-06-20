@@ -90,6 +90,39 @@ All output is S-expression facts, one per line.
 
 ---
 
+## Example Agent Prompts
+
+Drive an agent (Claude Code, Codex, ...) with the query-before-code workflow.
+
+**Refactoring task (detailed):**
+```
+Extract the validation logic from OperativesService into a separate module.
+First use the codespaces skill -- do not read source blindly:
+
+1. Find the module: search "operatives.*service"
+2. Run analyze on the found ID -- show boundary, deps, rdeps, layer, violations
+3. Check the blast radius: rdeps <id> 2 -- who breaks if I change this
+4. Read ONLY the boundary files from the analyze output, not the whole directory
+5. Propose a refactoring plan accounting for the blast radius, then change the code
+6. After the change, run boundaries <id> -- confirm there are no new violations
+```
+
+**Quick debugging (daily):**
+```
+Use the codespaces belief map before reading code.
+Task: why does file upload in drive fail?
+Run quick "drive upload", read only the boundary files, find the root cause.
+```
+
+**Standing instruction (pin in your agent config):**
+```
+Before any non-trivial code change, query the belief map first
+(search -> analyze -> rdeps), read only boundary files, and run
+boundaries after the change.
+```
+
+---
+
 ## Skill Structure
 
 ```
