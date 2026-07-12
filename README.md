@@ -170,8 +170,6 @@ codespaces/
     scheme-queries.md           # Scheme query language reference
   tests/
     test_belief_search.py
-  .agents/designs/
-    infra-topology-builders.md  # Design notes for the topology builder
 ```
 
 ---

@@ -1,3 +1,11 @@
+## 2026-07-12
+
+### Changes
+- Removed the obsolete `.agents` infrastructure-topology design notes and their README tree entry.
+
+### Motivation
+- The topology builder is implemented in the source, so retaining its original design notes duplicated completed work and left an unused `.agents` directory.
+
 ## 2026-06-19
 
 ### Changes
