@@ -1,3 +1,22 @@
+## 2026-07-13
+
+### Changes
+- Added focused regression evals for cache validity, Python and TypeScript import impact, LSP batch progress, source-root resolution, layer classification, deterministic output, language gating, and infrastructure diagnostics.
+- Made the existing belief-search tests load the checked-out repository script instead of a machine-specific installed path.
+
+### Fixes
+- Invalidated incremental cache entries by complete SHA-256 content hash instead of mtime and partial-file hashing.
+- Restored source-aware queries by resolving source paths from the directory containing the belief map.
+- Prevented reference-only LSP batches from looping without progress.
+- Included nested and parent-relative Python imports in dependency edges.
+- Resolved TypeScript ESM `.js` import specifiers to their checked-in `.ts` and `.tsx` sources.
+- Stopped backend modules named as stores from being classified as UI unless their path has a frontend boundary.
+- Removed generated timestamps from the semantic map and made empty infrastructure output name its supported formats.
+- Canonicalized the scan root once so macOS path aliases do not leak into module IDs.
+
+### Motivation
+- The audit findings were reproducible on isolated fixtures and the Upgraide mono workspace; these changes address the smallest correctness blockers while leaving unsupported languages and infrastructure formats explicit.
+
 ## 2026-07-12
 
 ### Changes

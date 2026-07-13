@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 
-SCRIPT_PATH = Path("/Users/alexeus/.codex/skills/codespaces/scripts/belief_search.py")
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "belief_search.py"
 SPEC = importlib.util.spec_from_file_location("belief_search", SCRIPT_PATH)
 belief_search = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

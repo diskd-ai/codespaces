@@ -198,12 +198,15 @@ class ProjectGroup:
 # ---------------------------------------------------------------------------
 
 def file_hash(path: str) -> str:
+    """Hash the complete file so restored mtimes cannot hide content changes."""
+    digest = hashlib.sha256()
     try:
-        st = os.stat(path)
         with open(path, "rb") as f:
-            chunk = f.read(8192)
-        return hashlib.md5(chunk + str(st.st_size).encode()).hexdigest()
-    except OSError:
+            while chunk := f.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError as exc:
+        print(f"[belief-map] ERROR: could not hash {path}: {exc}", file=sys.stderr)
         return ""
 
 
@@ -747,8 +750,8 @@ def parse_python(path: str, content: str, repo: str, mtime: float) -> FileResult
     try:
         tree = ast.parse(content, filename=path)
 
-        for node in ast.iter_child_nodes(tree):
-            # -- imports --
+        # Imports can be conditional or function-local, so walk the full tree.
+        for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     imports.append(alias.name)
@@ -759,7 +762,7 @@ def parse_python(path: str, content: str, repo: str, mtime: float) -> FileResult
                         module=alias.name,
                     ))
             elif isinstance(node, ast.ImportFrom):
-                mod = node.module or ""
+                mod = ("." * node.level) + (node.module or "")
                 if mod:
                     imports.append(mod)
                 for alias in node.names:
@@ -770,8 +773,9 @@ def parse_python(path: str, content: str, repo: str, mtime: float) -> FileResult
                         module=mod,
                     ))
 
-            # -- classes --
-            elif isinstance(node, ast.ClassDef):
+        # Entities remain top-level so nested functions do not become modules.
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.ClassDef):
                 methods = []
                 decorators = [
                     _decorator_name(d) for d in node.decorator_list
@@ -815,7 +819,8 @@ def parse_python(path: str, content: str, repo: str, mtime: float) -> FileResult
                     if isinstance(target, ast.Name) and target.id.isupper():
                         exported_names.append(target.id)
 
-    except SyntaxError:
+    except SyntaxError as exc:
+        print(f"[belief-map] WARNING: AST parse failed for {path}: {exc}", file=sys.stderr)
         # Fallback: regex for imports only
         for m in re.finditer(
             r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))",
@@ -1205,13 +1210,23 @@ def parse_file(args: tuple[str, str, str]) -> Optional[FileResult]:
         if language == "python":
             return parse_python(path, content, repo, mtime)
         return parse_typescript_treesitter(path, content, repo, mtime)
-    except Exception:
+    except Exception as exc:
+        print(f"[belief-map] ERROR: could not parse {path}: {exc}", file=sys.stderr)
         return None
 
 
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
+
+def detect_source_language(filename: str) -> Optional[str]:
+    """Return the supported parser language for a source filename."""
+    if filename.endswith(".py"):
+        return "python"
+    if (filename.endswith(".ts") or filename.endswith(".tsx")) and not filename.endswith(".d.ts"):
+        return "typescript"
+    return None
+
 
 def discover_files(root: str) -> list[tuple[str, str, str]]:
     results: list[tuple[str, str, str]] = []
@@ -1229,13 +1244,11 @@ def discover_files(root: str) -> list[tuple[str, str, str]]:
                             child_repo = entry.name
                         _walk(dir_path / entry.name, child_repo)
                     elif entry.is_file(follow_symlinks=False):
-                        name = entry.name
-                        if name.endswith(".py"):
-                            results.append((entry.path, "python", repo))
-                        elif (name.endswith(".ts") or name.endswith(".tsx")) and not name.endswith(".d.ts"):
-                            results.append((entry.path, "typescript", repo))
-        except PermissionError:
-            pass
+                        language = detect_source_language(entry.name)
+                        if language is not None:
+                            results.append((entry.path, language, repo))
+        except PermissionError as exc:
+            print(f"[belief-map] WARNING: could not scan {dir_path}: {exc}", file=sys.stderr)
 
     _walk(root_path, root_path.name)
     return results
@@ -1251,8 +1264,8 @@ def load_cache(root: str) -> dict:
         try:
             with open(cache_path, "r") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[belief-map] WARNING: could not load cache {cache_path}: {exc}", file=sys.stderr)
     return {}
 
 
@@ -1260,6 +1273,20 @@ def save_cache(root: str, cache: dict):
     cache_path = os.path.join(root, CACHE_FILE)
     with open(cache_path, "w") as f:
         json.dump(cache, f)
+
+
+def is_cache_entry_current(path: str, entry: object) -> bool:
+    """Return whether a cache entry matches the file's complete content hash."""
+    if not isinstance(entry, dict):
+        return False
+    result = entry.get("result")
+    if not isinstance(result, dict):
+        return False
+    cached_hash = result.get("content_hash")
+    if not isinstance(cached_hash, str) or not cached_hash:
+        return False
+    current_hash = file_hash(path)
+    return bool(current_hash) and current_hash == cached_hash
 
 
 # ---------------------------------------------------------------------------
@@ -1325,6 +1352,14 @@ def _load_ts_path_aliases(root: str) -> dict[str, str]:
     return alias_map
 
 
+def _typescript_resolution_bases(resolved: str) -> tuple[str, ...]:
+    """Return filesystem bases for TypeScript ESM specifiers such as `.js`."""
+    for emitted_suffix in (".js", ".jsx", ".mjs", ".cjs"):
+        if resolved.endswith(emitted_suffix):
+            return (resolved[: -len(emitted_suffix)], resolved)
+    return (resolved,)
+
+
 def _resolve_ts_path_alias(
     imp: str,
     source_path: str,
@@ -1345,17 +1380,18 @@ def _resolve_ts_path_alias(
             remainder = imp[len(prefix):]
             base_dir = alias_map[prefix]
             resolved = os.path.normpath(os.path.join(base_dir, remainder))
-            for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx", ".js", "/index.js"):
-                candidate = resolved + ext
-                if candidate in path_to_id:
-                    return path_to_id[candidate]
-                # path_to_id may use relative paths -- try relative form too
-                try:
-                    rel_candidate = os.path.relpath(candidate, root) if root else candidate
-                except ValueError:
-                    rel_candidate = candidate
-                if rel_candidate in path_to_id:
-                    return path_to_id[rel_candidate]
+            for resolution_base in _typescript_resolution_bases(resolved):
+                for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx", ".js", "/index.js"):
+                    candidate = resolution_base + ext
+                    if candidate in path_to_id:
+                        return path_to_id[candidate]
+                    # path_to_id may use relative paths -- try relative form too
+                    try:
+                        rel_candidate = os.path.relpath(candidate, root) if root else candidate
+                    except ValueError:
+                        rel_candidate = candidate
+                    if rel_candidate in path_to_id:
+                        return path_to_id[rel_candidate]
 
     return None
 
@@ -1381,25 +1417,35 @@ def resolve_import(
             return None
         source_dir = os.path.dirname(source_path)
         resolved = os.path.normpath(os.path.join(source_dir, imp))
-        for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx", ".js", "/index.js"):
-            candidate = resolved + ext
-            if candidate in path_to_id:
-                return path_to_id[candidate]
+        for resolution_base in _typescript_resolution_bases(resolved):
+            for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx", ".js", "/index.js"):
+                candidate = resolution_base + ext
+                if candidate in path_to_id:
+                    return path_to_id[candidate]
     elif language == "python":
-        parts = imp.split(".")
+        relative_level = len(imp) - len(imp.lstrip("."))
+        module_name = imp[relative_level:]
+        parts = [part for part in module_name.split(".") if part]
         # Build candidate base directories: walk up from source_dir to root,
         # collecting every directory that contains the first import segment.
-        bases: list[str] = [root, os.path.dirname(source_path)]
+        source_dir = Path(os.path.abspath(source_path)).parent
+        root_path = Path(os.path.abspath(root))
+        if relative_level:
+            relative_base = source_dir
+            for _ in range(relative_level - 1):
+                relative_base = relative_base.parent
+            bases: list[str] = [str(relative_base)]
+        else:
+            bases = [str(root_path), str(source_dir)]
         first_segment = parts[0] if parts else ""
-        cur = os.path.dirname(source_path)
-        while cur and cur >= root:
-            if os.path.isdir(os.path.join(cur, first_segment)):
-                if cur not in bases:
-                    bases.append(cur)
-            parent = os.path.dirname(cur)
-            if parent == cur:
+        cur = source_dir
+        while not relative_level and (cur == root_path or root_path in cur.parents):
+            cur_str = str(cur)
+            if first_segment and (cur / first_segment).is_dir() and cur_str not in bases:
+                bases.append(cur_str)
+            if cur == root_path:
                 break
-            cur = parent
+            cur = cur.parent
         for base in bases:
             # Try direct .py file first, then __init__.py
             for ext in (".py", "/__init__.py"):
@@ -1441,26 +1487,35 @@ def _resolve_submodule_imports(
         return extra_imports
 
     # Build base dirs: walk up from source to root (same as resolve_import)
-    all_bases: list[str] = [root, os.path.dirname(result.path)]
+    root_path = Path(os.path.abspath(root))
+    source_dir = Path(os.path.abspath(result.path)).parent
+    all_bases: list[str] = [str(root_path), str(source_dir)]
     for imp_name in result.imported_names:
         mod = imp_name.get("module", "") if isinstance(imp_name, dict) else imp_name.module
         orig = imp_name.get("original", "") if isinstance(imp_name, dict) else imp_name.original_name
         if not mod or not orig:
             continue
-        parts = mod.split(".")
+        relative_level = len(mod) - len(mod.lstrip("."))
+        module_name = mod[relative_level:]
+        parts = [part for part in module_name.split(".") if part]
         first_seg = parts[0] if parts else ""
 
         # Collect all viable bases including walk-up
-        bases = list(all_bases)
-        cur = os.path.dirname(result.path)
-        while cur and cur >= root:
-            if os.path.isdir(os.path.join(cur, first_seg)):
-                if cur not in bases:
-                    bases.append(cur)
-            parent = os.path.dirname(cur)
-            if parent == cur:
+        if relative_level:
+            relative_base = source_dir
+            for _ in range(relative_level - 1):
+                relative_base = relative_base.parent
+            bases = [str(relative_base)]
+        else:
+            bases = list(all_bases)
+        cur = source_dir
+        while not relative_level and (cur == root_path or root_path in cur.parents):
+            cur_str = str(cur)
+            if first_seg and (cur / first_seg).is_dir() and cur_str not in bases:
+                bases.append(cur_str)
+            if cur == root_path:
                 break
-            cur = parent
+            cur = cur.parent
 
         for base in bases:
             submod_path = os.path.normpath(os.path.join(base, *parts, orig + ".py"))
@@ -2419,6 +2474,75 @@ def _drain_prepare_batch(
     return calls_found
 
 
+def _partition_lsp_batch(
+    pending_prepare: list[tuple[int, str, dict]],
+    pending_refs: list[tuple[int, str, str]],
+    batch_size: int,
+) -> tuple[
+    list[tuple[int, str, dict]],
+    list[tuple[int, str, str]],
+    list[tuple[int, str, dict]],
+    list[tuple[int, str, str]],
+]:
+    """Take a bounded mixed LSP batch while guaranteeing queue progress."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    prepare_count = min(len(pending_prepare), batch_size // 2)
+    reference_count = min(len(pending_refs), batch_size - prepare_count)
+    remaining_capacity = batch_size - prepare_count - reference_count
+    prepare_count += min(len(pending_prepare) - prepare_count, remaining_capacity)
+    return (
+        pending_prepare[:prepare_count],
+        pending_refs[:reference_count],
+        pending_prepare[prepare_count:],
+        pending_refs[reference_count:],
+    )
+
+
+def _drain_reference_batch(
+    client: "LspClient",
+    batch: list[tuple[int, str, str]],
+    path_to_node_id: dict[str, str],
+    node_id_to_result: dict[str, FileResult],
+    lsp_edges: list[LspEdge],
+    timeout: float,
+) -> int:
+    """Collect reference requests and append resolved cross-module edges."""
+    refs_found = 0
+    for mid, ent_name, src_node_id in batch:
+        ref_locations = client._request_collect(mid, timeout=timeout)
+        if not isinstance(ref_locations, list):
+            continue
+        for loc in ref_locations:
+            ref_uri = loc.get("uri", "")
+            ref_path = uri_to_path(ref_uri)
+            ref_node_id = path_to_node_id.get(ref_path)
+            if not ref_node_id or ref_node_id == src_node_id:
+                continue
+            ref_result = node_id_to_result.get(ref_node_id)
+            ref_line_0 = loc.get("range", {}).get("start", {}).get("line", 0)
+            ref_entity_name = None
+            if ref_result:
+                ref_entity_name = _find_enclosing_entity(
+                    ref_result.entities,
+                    ref_line_0,
+                )
+            source_key = (
+                f"{ref_node_id}::{ref_entity_name}"
+                if ref_entity_name
+                else ref_node_id
+            )
+            target_key = f"{src_node_id}::{ent_name}"
+            lsp_edges.append(LspEdge(
+                source=source_key,
+                target=target_key,
+                edge_type="REFERENCES",
+                metadata={"lsp_verified": True, "ref_line": ref_line_0 + 1},
+            ))
+            refs_found += 1
+    return refs_found
+
+
 def _find_enclosing_entity(
     entities: list[dict], line_0based: int,
 ) -> Optional[str]:
@@ -2594,44 +2718,40 @@ def analyze_project_lsp(
 
                 # Drain pipeline if too many in-flight
                 while len(pending_prepare) + len(pending_refs) >= PIPELINE_BATCH:
+                    prepare_batch, reference_batch, pending_prepare, pending_refs = (
+                        _partition_lsp_batch(
+                            pending_prepare,
+                            pending_refs,
+                            PIPELINE_BATCH,
+                        )
+                    )
                     calls_found += _drain_prepare_batch(
-                        client, pending_prepare[:PIPELINE_BATCH // 2],
+                        client, prepare_batch,
                         path_to_node_id, node_id, lsp_edges, request_timeout,
                     )
-                    pending_prepare = pending_prepare[PIPELINE_BATCH // 2:]
+                    refs_found += _drain_reference_batch(
+                        client,
+                        reference_batch,
+                        path_to_node_id,
+                        node_id_to_result,
+                        lsp_edges,
+                        request_timeout,
+                    )
 
             # -- Collect remaining prepareCallHierarchy results --
             calls_found += _drain_prepare_batch(
                 client, pending_prepare, path_to_node_id, node_id, lsp_edges, request_timeout,
             )
 
-            # -- Collect references results --
-            for mid, ent_name, src_node_id in pending_refs:
-                ref_locations = client._request_collect(mid, timeout=request_timeout)
-                if not isinstance(ref_locations, list):
-                    continue
-                for loc in ref_locations:
-                    ref_uri = loc.get("uri", "")
-                    ref_path = uri_to_path(ref_uri)
-                    ref_node_id = path_to_node_id.get(ref_path)
-                    if not ref_node_id or ref_node_id == src_node_id:
-                        continue
-                    ref_result = node_id_to_result.get(ref_node_id)
-                    ref_line_0 = loc.get("range", {}).get("start", {}).get("line", 0)
-                    ref_entity_name = None
-                    if ref_result:
-                        ref_entity_name = _find_enclosing_entity(
-                            ref_result.entities, ref_line_0,
-                        )
-                    source_key = f"{ref_node_id}::{ref_entity_name}" if ref_entity_name else ref_node_id
-                    target_key = f"{src_node_id}::{ent_name}"
-                    lsp_edges.append(LspEdge(
-                        source=source_key,
-                        target=target_key,
-                        edge_type="REFERENCES",
-                        metadata={"lsp_verified": True, "ref_line": ref_line_0 + 1},
-                    ))
-                    refs_found += 1
+            # -- Collect remaining references results --
+            refs_found += _drain_reference_batch(
+                client,
+                pending_refs,
+                path_to_node_id,
+                node_id_to_result,
+                lsp_edges,
+                request_timeout,
+            )
 
             processed += len(r.entities)
             if processed % 200 < len(r.entities):
@@ -2942,8 +3062,7 @@ def write_sexp(
     violations = [e for e in edges if e.get("type") == "VIOLATION"]
     real_edges = [e for e in edges if e.get("type") != "VIOLATION"]
 
-    lines.append(f"; Belief Map")
-    lines.append(f"; generated {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    lines.append("; Belief Map")
     lines.append(f"; mode {mode}")
     lines.append(f"; {total_files} files {len(sorted_nodes)} nodes {len(real_edges)} edges {len(violations)} violations")
     lines.append("")
@@ -3023,7 +3142,7 @@ def write_sexp(
             lines.append(f"(refs {src} {tgt}{lsp})")
         elif etype == "CALLS":
             fl = edge.get("from_lines", [])
-            lns = f" :lines {' '.join(str(l) for l in fl)}" if fl else ""
+            lns = f" :lines {' '.join(str(line) for line in fl)}" if fl else ""
             lines.append(f"(calls {src} {tgt}{lns} :lsp)")
         elif etype == "HTTP_CALLS":
             client = edge.get("client_entity", "")
@@ -3073,7 +3192,7 @@ def main():
             clean_args.append(args[i])
         i += 1
 
-    root = os.path.abspath(clean_args[0] if clean_args else ".")
+    root = os.path.realpath(clean_args[0] if clean_args else ".")
     if not os.path.isdir(root):
         print(f"Error: {root} is not a directory", file=sys.stderr)
         sys.exit(1)
@@ -3083,9 +3202,10 @@ def main():
     print(f"[belief-map] Scanning {root} ... (mode: {mode})")
 
     files = discover_files(root)
-    py_count = sum(1 for _, l, _ in files if l == "python")
-    ts_count = sum(1 for _, l, _ in files if l == "typescript")
+    py_count = sum(1 for _, language, _ in files if language == "python")
+    ts_count = sum(1 for _, language, _ in files if language == "typescript")
     print(f"[belief-map] Found {len(files)} source files ({py_count} py, {ts_count} ts)")
+    print("[belief-map] Supported source: .py, .ts, .tsx; other languages are excluded")
 
     cache = {} if full_rebuild else load_cache(root)
     to_parse: list[tuple[str, str, str]] = []
@@ -3093,14 +3213,9 @@ def main():
 
     for path, lang, repo in files:
         entry = cache.get(path)
-        if entry and not full_rebuild:
-            try:
-                cur_mtime = os.path.getmtime(path)
-                if cur_mtime <= entry.get("mtime", 0):
-                    cached_results.append(FileResult(**entry["result"]))
-                    continue
-            except OSError:
-                pass
+        if entry and not full_rebuild and is_cache_entry_current(path, entry):
+            cached_results.append(FileResult(**entry["result"]))
+            continue
         to_parse.append((path, lang, repo))
 
     print(f"[belief-map] Parsing {len(to_parse)} changed files ({len(cached_results)} cached)")

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """build_infra_topology.py -- scan Kustomize, Helm, and Terraform files and
 emit infra topology facts in sexp format.
 
@@ -14,6 +12,8 @@ Options:
     --append FILE Append output to existing sexp file
     --stdout      Print to stdout (default if no --append)
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -820,11 +820,12 @@ def main() -> None:
         print(w, file=sys.stderr)
 
     if not merged.nodes and not merged.edges:
-        print("; info: no infrastructure files found", file=sys.stderr)
+        empty_message = "; info: no supported Kustomize, Helm, or Terraform files found"
+        print(empty_message, file=sys.stderr)
         if not stdout_mode and append_file is None:
             return
         # Still write the comment so callers know the script ran
-        output_lines = ["", "; --- infrastructure topology ---", "; info: no infrastructure files found"]
+        output_lines = ["", "; --- infrastructure topology ---", empty_message]
     else:
         output_lines = render_sexp(merged.nodes, merged.edges)
 

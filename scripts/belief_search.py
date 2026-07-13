@@ -224,7 +224,7 @@ class BeliefGraph:
         self._root: str = ""
 
     def load(self, path: str) -> None:
-        self._root = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+        self._root = os.path.dirname(os.path.abspath(path))
         pmap: dict[str, str] = {}
 
         in_paths = False
@@ -511,7 +511,7 @@ def _classify_layer_fallback(p: str) -> str:
         return "infra"
     if "/commons/" in p or "/common/" in p or "/utils/" in p or "/result" in p or "/types/" in p:
         return "shared"
-    if "/components/" in p or "/pages/" in p or "/ui/" in p or "/hooks/" in p or "/stores/" in p:
+    if "/components/" in p or "/pages/" in p or "/ui/" in p or "/hooks/" in p:
         return "ui"
     # NestJS / backend patterns
     if "/dto/" in p or "/dtos/" in p:
@@ -535,7 +535,7 @@ def _classify_layer_fallback(p: str) -> str:
     if "/lib/" in p or "/helpers/" in p or "/constants/" in p or "/decorators/" in p or "/mappers/" in p:
         return "shared"
     # UI patterns (state management tied to UI)
-    if ("/stores/" in p or "/store/" in p or "/contexts/" in p or "/providers/" in p) and "/ui/" in p:
+    if ("/stores/" in p or "/store/" in p or "/contexts/" in p or "/providers/" in p) and ("/ui/" in p or "/web/" in p):
         return "ui"
     # Test patterns
     if "/fixtures/" in p or "/mocks/" in p or "/__mocks__/" in p or "/factories/" in p:
@@ -614,7 +614,7 @@ _PURPOSE_TO_LAYER: dict[str, str] = {
     "UI component": "ui",
     "page/route": "ui",
     "React hook": "ui",
-    "state store": "ui",
+    "state store": "other",
     # Test layer
     "test": "test",
     "test fixture": "test",
@@ -2175,7 +2175,7 @@ def find_sexp_file() -> str:
     if json_found:
         print(f"Error: found JSON belief map at {json_found} but this script requires sexp format.", file=sys.stderr)
         print("Rebuild with the sexp builder:", file=sys.stderr)
-        print(f"  python3 ~/.claude/skills/codespaces/scripts/build_belief_map.py", file=sys.stderr)
+        print("  python3 ~/.claude/skills/codespaces/scripts/build_belief_map.py", file=sys.stderr)
     else:
         print("Error: .belief_map.sexp not found. Run build_belief_map.py first.", file=sys.stderr)
     sys.exit(1)
