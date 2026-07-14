@@ -1,3 +1,17 @@
+## 2026-07-14
+
+### Changes
+- Added focused regression coverage for TSX imports, re-exports, literal runtime imports, project-scoped aliases, exact aliases, and package self-imports.
+
+### Fixes
+- Resolved TypeScript and TSX dependencies through the same module resolver.
+- Kept duplicate path aliases within their owning `tsconfig.json` boundary and supported exact aliases plus multiple configured targets.
+- Added import edges for `export ... from`, literal `import()`, and literal `require()` forms.
+- Resolved exact package self-imports to the nearest owning package source entrypoint without shadowing installed dependencies.
+
+### Motivation
+- The Upgraide monorepo compiler oracle now measures 99.899% local dependency recall and 99.832% precision, reducing architecture-query omissions without embedding a complete TypeScript resolver.
+
 ## 2026-07-13
 
 ### Changes

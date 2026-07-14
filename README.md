@@ -1,6 +1,8 @@
 # Codespaces Skill
 
 > **Install:** `npx skills add diskd-ai/codespaces` | [skills.sh](https://skills.sh)
+>
+> **Release notes:** [Changelog](CHANGELOG.md)
 
 Query a `.belief_map.sexp` graph to discover module boundaries, dependencies, and blast radius before reading source -- so you read the minimal set of files, never whole directories.
 

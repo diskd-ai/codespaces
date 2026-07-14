@@ -193,6 +193,30 @@ class ProjectGroup:
     files: list[FileResult] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class TsPathAlias:
+    """One validated TypeScript path mapping owned by a tsconfig."""
+
+    pattern: str
+    target_patterns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TsPathAliasContext:
+    """Path mappings whose scope starts at a tsconfig directory."""
+
+    config_directory: str
+    aliases: tuple[TsPathAlias, ...]
+
+
+@dataclass(frozen=True)
+class TsPackage:
+    """A local TypeScript package identified by its package.json contract."""
+
+    name: str
+    directory: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -999,6 +1023,42 @@ def _ts_get_obj_keys(node) -> list[str]:  # type: ignore[no-untyped-def]
     return keys
 
 
+def _ts_dependency_specifiers(root) -> list[str]:  # type: ignore[no-untyped-def]
+    """Extract static and literal runtime dependencies in source order."""
+    dependencies: list[str] = []
+    seen: set[str] = set()
+
+    def _append_string(node) -> None:  # type: ignore[no-untyped-def]
+        if node is None or node.type != "string" or not node.text:
+            return
+        specifier = node.text.decode("utf-8").strip("'\"")
+        if specifier and specifier not in seen:
+            seen.add(specifier)
+            dependencies.append(specifier)
+
+    def _visit(node) -> None:  # type: ignore[no-untyped-def]
+        if node.type in ("import_statement", "export_statement"):
+            _append_string(node.child_by_field_name("source"))
+        elif node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            function_name = (
+                function.text.decode("utf-8")
+                if function is not None and function.text
+                else ""
+            )
+            if function_name in ("import", "require"):
+                arguments = node.child_by_field_name("arguments")
+                if arguments is not None:
+                    first_argument = next(iter(arguments.named_children), None)
+                    _append_string(first_argument)
+
+        for child in node.named_children:
+            _visit(child)
+
+    _visit(root)
+    return dependencies
+
+
 def parse_typescript_treesitter(
     path: str, content: str, repo: str, mtime: float,
 ) -> FileResult:
@@ -1008,7 +1068,7 @@ def parse_typescript_treesitter(
     tree = parser.parse(content.encode("utf-8"))
     root = tree.root_node
 
-    imports: list[str] = []
+    imports = _ts_dependency_specifiers(root)
     exports_abstract: list[str] = []
     implements_list: list[str] = []
     extends_list: list[str] = []
@@ -1034,7 +1094,6 @@ def parse_typescript_treesitter(
             source_node = node.child_by_field_name("source")
             if source_node:
                 specifier = source_node.text.decode("utf-8").strip("'\"")
-                imports.append(specifier)
                 # Extract named imports
                 for child in node.children:
                     if child.type == "import_clause":
@@ -1295,61 +1354,104 @@ def is_cache_entry_current(path: str, entry: object) -> bool:
 # TypeScript path alias resolution (tsconfig.json "paths")
 # ---------------------------------------------------------------------------
 
-def _load_ts_path_aliases(root: str) -> dict[str, str]:
-    """Scan for tsconfig.json files and build a global alias -> absolute directory map.
-
-    For each tsconfig with compilerOptions.paths, resolves alias patterns like
-    ``@sdk/* -> ['../../sdk/src/*']`` relative to the tsconfig's directory.
-
-    Returns {alias_prefix: absolute_directory} e.g. {"@sdk/": "/abs/path/to/sdk/src/"}.
-    """
+def _load_ts_path_aliases(root: str) -> tuple[TsPathAliasContext, ...]:
+    """Load validated path mappings without merging independent projects."""
     import json as _json
 
-    alias_map: dict[str, str] = {}
-    # Walk up to 4 directory levels for tsconfig files (covers monorepo structures)
+    contexts: list[TsPathAliasContext] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Skip node_modules, .git, dist, build
         dirnames[:] = [
             d for d in dirnames
             if d not in ("node_modules", ".git", "dist", "build", ".next", ".cache")
         ]
-        depth = dirpath[len(root):].count(os.sep)
-        if depth > 5:
-            dirnames.clear()
-            continue
         for fname in filenames:
-            if fname == "tsconfig.json":
-                tsconfig_path = os.path.join(dirpath, fname)
-                try:
-                    with open(tsconfig_path, "r") as f:
-                        raw = f.read()
-                    # Strip single-line comments (tsconfig allows them)
-                    raw = re.sub(r"//.*$", "", raw, flags=re.MULTILINE)
-                    # Strip trailing commas before } or ]
-                    raw = re.sub(r",(\s*[}\]])", r"\1", raw)
-                    data = _json.loads(raw)
-                    paths = data.get("compilerOptions", {}).get("paths", {})
-                    for alias_pattern, targets in paths.items():
-                        if not alias_pattern.endswith("/*") or not targets:
-                            continue
-                        prefix = alias_pattern[:-1]  # "@sdk/*" -> "@sdk/"
-                        target = targets[0]  # Take first target
-                        if not target.endswith("/*"):
-                            continue
-                        target_dir = target[:-2]  # "./*" -> ".", "../../sdk/src/*" -> "../../sdk/src"
-                        abs_target = os.path.normpath(os.path.join(dirpath, target_dir))
-                        # If target dir has a `src/` subdirectory, prefer it
-                        # (common monorepo pattern: @sdk/* -> ['./*'] maps to pkg root,
-                        # but actual source lives in pkg/src/)
-                        src_subdir = os.path.join(abs_target, "src")
-                        effective_target = src_subdir if os.path.isdir(src_subdir) else abs_target
-                        if os.path.isdir(abs_target):
-                            # Longer (more specific) prefixes take priority
-                            if prefix not in alias_map or len(effective_target) > len(alias_map[prefix]):
-                                alias_map[prefix] = effective_target
-                except Exception:
+            if fname != "tsconfig.json":
+                continue
+
+            tsconfig_path = os.path.join(dirpath, fname)
+            try:
+                with open(tsconfig_path, "r", encoding="utf-8") as file:
+                    raw = file.read()
+                raw = re.sub(r"//.*$", "", raw, flags=re.MULTILINE)
+                raw = re.sub(r",(\s*[}\]])", r"\1", raw)
+                data = _json.loads(raw)
+            except (OSError, _json.JSONDecodeError) as error:
+                print(
+                    f"[belief-map] Cannot read TS aliases from {tsconfig_path}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+
+            if not isinstance(data, dict):
+                continue
+            compiler_options = data.get("compilerOptions")
+            if not isinstance(compiler_options, dict):
+                continue
+            paths = compiler_options.get("paths")
+            if not isinstance(paths, dict):
+                continue
+            configured_base = compiler_options.get("baseUrl", ".")
+            if not isinstance(configured_base, str):
+                continue
+            base_directory = os.path.normpath(os.path.join(dirpath, configured_base))
+
+            aliases: list[TsPathAlias] = []
+            for alias_pattern, targets in paths.items():
+                if not isinstance(alias_pattern, str):
                     continue
-    return alias_map
+                if not isinstance(targets, list):
+                    continue
+                target_patterns = tuple(
+                    os.path.normpath(os.path.join(base_directory, target))
+                    for target in targets
+                    if isinstance(target, str)
+                )
+                if target_patterns:
+                    aliases.append(TsPathAlias(alias_pattern, target_patterns))
+
+            if aliases:
+                contexts.append(TsPathAliasContext(
+                    config_directory=os.path.normpath(dirpath),
+                    aliases=tuple(sorted(
+                        aliases,
+                        key=lambda alias: len(alias.pattern),
+                        reverse=True,
+                    )),
+                ))
+
+    return tuple(sorted(
+        contexts,
+        key=lambda context: len(Path(context.config_directory).parts),
+        reverse=True,
+    ))
+
+
+def _load_ts_packages(root: str) -> tuple[TsPackage, ...]:
+    """Load local package identities used by workspace self-imports."""
+    packages: list[TsPackage] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [directory for directory in dirnames if directory not in SKIP_DIRS]
+        if "package.json" not in filenames:
+            continue
+
+        package_path = os.path.join(dirpath, "package.json")
+        try:
+            with open(package_path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as error:
+            print(
+                f"[belief-map] Cannot read local package identity from {package_path}: {error}",
+                file=sys.stderr,
+            )
+            continue
+
+        if not isinstance(data, dict):
+            continue
+        name = data.get("name")
+        if isinstance(name, str) and name:
+            packages.append(TsPackage(name, os.path.normpath(dirpath)))
+
+    return tuple(sorted(packages, key=lambda package: len(package.name), reverse=True))
 
 
 def _typescript_resolution_bases(resolved: str) -> tuple[str, ...]:
@@ -1360,39 +1462,102 @@ def _typescript_resolution_bases(resolved: str) -> tuple[str, ...]:
     return (resolved,)
 
 
+def _resolve_typescript_path(
+    resolved: str,
+    root: str,
+    path_to_id: dict[str, str],
+) -> Optional[str]:
+    for base in _typescript_resolution_bases(resolved):
+        for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx"):
+            candidate = base + ext
+            if candidate in path_to_id:
+                return path_to_id[candidate]
+            try:
+                relative_candidate = os.path.relpath(candidate, root)
+            except ValueError:
+                relative_candidate = candidate
+            if relative_candidate in path_to_id:
+                return path_to_id[relative_candidate]
+    return None
+
+
+def _is_within(path: str, directory: str) -> bool:
+    try:
+        return os.path.commonpath((path, directory)) == directory
+    except ValueError:
+        return False
+
+
+def _match_ts_alias(pattern: str, imp: str) -> Optional[str]:
+    if "*" not in pattern:
+        return "" if imp == pattern else None
+    prefix, suffix = pattern.split("*", 1)
+    if not imp.startswith(prefix) or not imp.endswith(suffix):
+        return None
+    remainder_end = len(imp) - len(suffix) if suffix else len(imp)
+    return imp[len(prefix):remainder_end]
+
+
 def _resolve_ts_path_alias(
     imp: str,
     source_path: str,
     root: str,
     path_to_id: dict[str, str],
-    alias_map: dict[str, str],
+    alias_contexts: tuple[TsPathAliasContext, ...],
 ) -> Optional[str]:
-    """Resolve a TypeScript import like '@sdk/llm/llmClientApi' using tsconfig paths.
-
-    Tries the most specific alias prefix first (longest match).
-    """
-    if not alias_map:
+    """Resolve an alias only through tsconfigs that own the source file."""
+    if not alias_contexts:
         return None
 
-    # Sort by prefix length descending so "@agent-upgraide/" matches before "@a/"
-    for prefix in sorted(alias_map, key=len, reverse=True):
-        if imp.startswith(prefix):
-            remainder = imp[len(prefix):]
-            base_dir = alias_map[prefix]
-            resolved = os.path.normpath(os.path.join(base_dir, remainder))
-            for resolution_base in _typescript_resolution_bases(resolved):
-                for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx", ".js", "/index.js"):
-                    candidate = resolution_base + ext
-                    if candidate in path_to_id:
-                        return path_to_id[candidate]
-                    # path_to_id may use relative paths -- try relative form too
-                    try:
-                        rel_candidate = os.path.relpath(candidate, root) if root else candidate
-                    except ValueError:
-                        rel_candidate = candidate
-                    if rel_candidate in path_to_id:
-                        return path_to_id[rel_candidate]
+    absolute_source = os.path.normpath(
+        source_path if os.path.isabs(source_path) else os.path.join(root, source_path)
+    )
+    for context in alias_contexts:
+        if not _is_within(absolute_source, context.config_directory):
+            continue
+        for alias in context.aliases:
+            remainder = _match_ts_alias(alias.pattern, imp)
+            if remainder is None:
+                continue
+            for target_pattern in alias.target_patterns:
+                resolved = target_pattern.replace("*", remainder, 1)
+                target_id = _resolve_typescript_path(resolved, root, path_to_id)
+                if target_id:
+                    return target_id
 
+    return None
+
+
+def _resolve_ts_package(
+    imp: str,
+    source_path: str,
+    root: str,
+    path_to_id: dict[str, str],
+    packages: tuple[TsPackage, ...],
+) -> Optional[str]:
+    """Resolve package self-imports without shadowing installed dependencies."""
+    absolute_source = os.path.normpath(
+        source_path if os.path.isabs(source_path) else os.path.join(root, source_path)
+    )
+    owners = tuple(
+        package
+        for package in packages
+        if _is_within(absolute_source, package.directory)
+    )
+    if not owners:
+        return None
+
+    owner = max(owners, key=lambda package: len(Path(package.directory).parts))
+    if imp != owner.name:
+        return None
+
+    for candidate in (
+        os.path.join(owner.directory, "src", "index"),
+        os.path.join(owner.directory, "index"),
+    ):
+        target_id = _resolve_typescript_path(candidate, root, path_to_id)
+        if target_id:
+            return target_id
     return None
 
 
@@ -1404,24 +1569,27 @@ def resolve_import(
     root: str,
     path_to_id: dict[str, str],
     language: str,
-    ts_path_aliases: "dict[str, str] | None" = None,
+    ts_path_aliases: "tuple[TsPathAliasContext, ...] | None" = None,
+    ts_packages: "tuple[TsPackage, ...] | None" = None,
 ) -> Optional[str]:
-    if language == "typescript":
+    if language in ("typescript", "tsx"):
         if not imp.startswith(".") and not imp.startswith("/"):
             # Try tsconfig paths alias resolution before giving up
             resolved_via_alias = _resolve_ts_path_alias(
-                imp, source_path, root, path_to_id, ts_path_aliases or {},
+                imp, source_path, root, path_to_id, ts_path_aliases or (),
             )
             if resolved_via_alias:
                 return resolved_via_alias
-            return None
+            return _resolve_ts_package(
+                imp,
+                source_path,
+                root,
+                path_to_id,
+                ts_packages or (),
+            )
         source_dir = os.path.dirname(source_path)
         resolved = os.path.normpath(os.path.join(source_dir, imp))
-        for resolution_base in _typescript_resolution_bases(resolved):
-            for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx", ".js", "/index.js"):
-                candidate = resolution_base + ext
-                if candidate in path_to_id:
-                    return path_to_id[candidate]
+        return _resolve_typescript_path(resolved, root, path_to_id)
     elif language == "python":
         relative_level = len(imp) - len(imp.lstrip("."))
         module_name = imp[relative_level:]
@@ -1557,7 +1725,10 @@ def build_graph(
     # Load tsconfig.json path aliases for resolving @sdk/*, @agent-*/* etc.
     ts_path_aliases = _load_ts_path_aliases(root)
     if ts_path_aliases:
-        print(f"[belief-map] Loaded {len(ts_path_aliases)} TS path aliases", file=sys.stderr)
+        print(f"[belief-map] Loaded {len(ts_path_aliases)} TS alias contexts", file=sys.stderr)
+    ts_packages = _load_ts_packages(root)
+    if ts_packages:
+        print(f"[belief-map] Loaded {len(ts_packages)} local TS packages", file=sys.stderr)
 
     # Map: abstract/interface name -> defining node id
     abstract_providers: dict[str, str] = {}
@@ -1643,7 +1814,15 @@ def build_graph(
 
         # -- module-level IMPORTS edges --
         for imp in r.imports:
-            target_id = resolve_import(imp, r.path, root, path_to_id, r.language, ts_path_aliases)
+            target_id = resolve_import(
+                imp,
+                r.path,
+                root,
+                path_to_id,
+                r.language,
+                ts_path_aliases,
+                ts_packages,
+            )
             if target_id and target_id != node_id:
                 edge_key = (node_id, target_id, "IMPORTS")
                 if edge_key not in seen_edges:

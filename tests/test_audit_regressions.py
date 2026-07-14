@@ -11,7 +11,6 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "build_belief_map.py"
 
@@ -38,6 +37,27 @@ build_infra_topology = _load_script(
 
 class AuditRegressionTest(unittest.TestCase):
     """Protect the audit findings that have small, locally owned fixes."""
+
+    def _parse_typescript(
+        self,
+        root: Path,
+        relative_path: str,
+        content: str,
+    ) -> object:
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        result = build_belief_map.parse_file((str(path), "typescript", "fixture"))
+        self.assertIsNotNone(result)
+        return result
+
+    def _import_edges(self, results: list[object], root: Path) -> set[tuple[str, str]]:
+        _nodes, edges = build_belief_map.build_graph(results, str(root))
+        return {
+            (edge["source"], edge["target"])
+            for edge in edges
+            if edge["type"] == "IMPORTS"
+        }
 
     def test_file_hash_covers_changes_after_first_eight_kibibytes(self) -> None:
         """/* REQ-CS-007: cache hashes must cover the complete source file. */"""
@@ -161,6 +181,163 @@ class AuditRegressionTest(unittest.TestCase):
         }
         self.assertIn(("source", "target"), import_edges)
 
+    def test_tsx_relative_import_resolves_to_typescript_module(self) -> None:
+        """/* REQ-CS-017: TSX imports must use TypeScript module resolution. */"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            component = self._parse_typescript(
+                root,
+                "src/component.tsx",
+                'import { helper } from "./helper";\nexport const Component = helper;\n',
+            )
+            helper = self._parse_typescript(
+                root,
+                "src/helper.ts",
+                "export const helper = 1;\n",
+            )
+
+            import_edges = self._import_edges([component, helper], root)
+
+        self.assertIn(("src/component", "src/helper"), import_edges)
+
+    def test_reexports_and_literal_runtime_imports_create_edges(self) -> None:
+        """/* REQ-CS-018: Literal TypeScript dependency forms must create edges. */"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entry = self._parse_typescript(
+                root,
+                "src/index.ts",
+                "\n".join(
+                    (
+                        'export { value } from "./value";',
+                        'export * from "./types";',
+                        'const lazy = import("./lazy");',
+                        'const legacy = require("./legacy");',
+                    )
+                ),
+            )
+            dependencies = [
+                self._parse_typescript(
+                    root, "src/value.ts", "export const value = 1;\n"
+                ),
+                self._parse_typescript(
+                    root, "src/types.ts", "export type Value = number;\n"
+                ),
+                self._parse_typescript(root, "src/lazy.ts", "export const lazy = 1;\n"),
+                self._parse_typescript(
+                    root, "src/legacy.ts", "export const legacy = 1;\n"
+                ),
+            ]
+
+            import_edges = self._import_edges([entry, *dependencies], root)
+
+        self.assertEqual(
+            {
+                ("src", "src/value"),
+                ("src", "src/types"),
+                ("src", "src/lazy"),
+                ("src", "src/legacy"),
+            },
+            import_edges,
+        )
+
+    def test_duplicate_aliases_resolve_within_the_owning_project(self) -> None:
+        """/* REQ-CS-019: TS path aliases must stay within their owning project. */"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            results: list[object] = []
+            for package in ("a", "b"):
+                package_root = root / "packages" / package
+                package_root.mkdir(parents=True)
+                (package_root / "tsconfig.json").write_text(
+                    '{"compilerOptions":{"baseUrl":".","paths":{"@/*":["src/*"]}}}',
+                    encoding="utf-8",
+                )
+                results.extend(
+                    (
+                        self._parse_typescript(
+                            root,
+                            f"packages/{package}/src/consumer.ts",
+                            'import { target } from "@/target";\n',
+                        ),
+                        self._parse_typescript(
+                            root,
+                            f"packages/{package}/src/target.ts",
+                            f'export const target = "{package}";\n',
+                        ),
+                    )
+                )
+
+            import_edges = self._import_edges(results, root)
+
+        self.assertIn(
+            ("packages/a/src/consumer", "packages/a/src/target"),
+            import_edges,
+        )
+        self.assertIn(
+            ("packages/b/src/consumer", "packages/b/src/target"),
+            import_edges,
+        )
+
+    def test_exact_alias_resolves_to_directory_index(self) -> None:
+        """/* REQ-CS-020: Exact TS path aliases must resolve without wildcards. */"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "tsconfig.json").write_text(
+                """{
+                    "compilerOptions": {
+                        "baseUrl": ".",
+                        "paths": {"@workspace/shared": ["packages/shared/src"]}
+                    }
+                }""",
+                encoding="utf-8",
+            )
+            consumer = self._parse_typescript(
+                root,
+                "packages/app/src/consumer.ts",
+                'import { shared } from "@workspace/shared";\n',
+            )
+            shared = self._parse_typescript(
+                root,
+                "packages/shared/src/index.ts",
+                "export const shared = 1;\n",
+            )
+
+            import_edges = self._import_edges([consumer, shared], root)
+
+        self.assertIn(
+            ("packages/app/src/consumer", "packages/shared/src"),
+            import_edges,
+        )
+
+    def test_package_self_import_resolves_source_entrypoint(self) -> None:
+        """/* REQ-CS-021: Package self-imports must resolve to source entrypoints. */"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            package_root = root / "packages" / "sdk"
+            package_root.mkdir(parents=True)
+            (package_root / "package.json").write_text(
+                '{"name":"@workspace/sdk","main":"./dist/index.js"}',
+                encoding="utf-8",
+            )
+            consumer = self._parse_typescript(
+                root,
+                "packages/sdk/examples/consumer.ts",
+                'import { sdk } from "@workspace/sdk";\n',
+            )
+            entrypoint = self._parse_typescript(
+                root,
+                "packages/sdk/src/index.ts",
+                "export const sdk = 1;\n",
+            )
+
+            import_edges = self._import_edges([consumer, entrypoint], root)
+
+        self.assertIn(
+            ("packages/sdk/examples/consumer", "packages/sdk/src"),
+            import_edges,
+        )
+
     def test_reference_only_lsp_batch_always_makes_progress(self) -> None:
         """/* REQ-CS-010: a full reference batch must be drained without looping. */"""
         references = [(index, f"name{index}", "module") for index in range(40)]
@@ -235,7 +412,9 @@ class AuditRegressionTest(unittest.TestCase):
     def test_language_detector_makes_unsupported_coverage_explicit(self) -> None:
         """/* REQ-CS-014: language gates must distinguish supported source files. */"""
         self.assertEqual(build_belief_map.detect_source_language("module.py"), "python")
-        self.assertEqual(build_belief_map.detect_source_language("module.tsx"), "typescript")
+        self.assertEqual(
+            build_belief_map.detect_source_language("module.tsx"), "typescript"
+        )
         self.assertIsNone(build_belief_map.detect_source_language("module.swift"))
         self.assertIsNone(build_belief_map.detect_source_language("bootstrap.sh"))
 
