@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-07-30
+
+### Changes
+
+- Required an explicit absolute project root for map builds and added custom
+  output/map-root query options.
+- Added pinned Python dependencies and documented the supported TypeScript and
+  safe search-pattern contracts.
+
+### Fixes
+
+- Made `CALLS_API` resolution deterministic by following explicit imports and
+  failing closed on ambiguous unqualified providers.
+- Rejected colliding module IDs before publication instead of silently
+  discarding source files.
+- Versioned incremental caches by schema and builder provenance.
+- Published cache and map files atomically under a per-project writer lock.
+- Rejected malformed maps, unsafe search patterns, and invalid query depths
+  with structured diagnostics.
+- Preserved source paths containing spaces and recognized TypeScript
+  `import = require()` plus literal template imports.
+
 ## 2026-07-14
 
 ### Changes

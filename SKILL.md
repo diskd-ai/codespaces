@@ -12,7 +12,8 @@ Query `.belief_map.sexp` to discover modules, boundaries, and dependencies befor
 
 ## Scripts
 
-This skill bundles Python scripts. Run them from the skill's base directory:
+This skill bundles Python scripts. Resolve the skill and target roots before
+running them so the scanned project is always explicit:
 
 - `scripts/belief_search.py` -- query the belief map graph
 - `scripts/build_belief_map.py` -- generate the belief map from source
@@ -27,9 +28,11 @@ Locate the belief map. If absent, build it:
 
 ```bash
 ls .belief_map.sexp belief_map.sexp 2>/dev/null
-# Build: pip3 install tree-sitter tree-sitter-typescript tree-sitter-python
-python3 scripts/build_belief_map.py          # incremental ~5s
-python3 scripts/build_belief_map.py --full   # full rebuild ~30s
+SKILL_ROOT="$(pwd -P)"
+TARGET_ROOT="$(cd /absolute/path/to/project && pwd -P)"
+python3 -m pip install -r "$SKILL_ROOT/requirements.txt"
+python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT"
+python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --full
 ```
 
 ## Mandatory Workflow: Query Before Code
@@ -69,7 +72,7 @@ python3 scripts/belief_search.py analyze <module-id>
 
 | Command | Purpose | Example |
 |---|---|---|
-| `search "<pattern>"` | Regex grep on graph (find module IDs) | `search "operative.*service"` |
+| `search "<pattern>"` | Safe literal/`.*` search on graph | `search "operative.*service"` |
 | `analyze <id>` | Full module analysis (PRIMARY command) | `analyze drive/modules/drive/drive_schema` |
 | `quick <keyword>` | Search + analyze first match (shortcut) | `quick operatives` |
 | `boundary <id>` | Files to read for a change | `boundary operatives.service` |
@@ -151,7 +154,7 @@ Compose queries for complex analysis. See [references/scheme-queries.md](referen
 (find-callers "fn" depth)      ; modules calling a function
 (find-calls "fn" depth)        ; modules a function calls
 (intersect A B)                ; set intersection
-(filter SET "pattern")         ; regex filter
+(filter SET "pattern")         ; safe literal/.* filter
 (files SET)                    ; resolve to file paths
 (count SET)                    ; count members
 (violations)                   ; modules with boundary violations
@@ -225,13 +228,23 @@ python3 scripts/belief_search.py analyze pki-service/src/modules/ca/ca.service
 ## Rebuilding the Graph
 
 ```bash
-python3 scripts/build_belief_map.py          # incremental (~5s)
-python3 scripts/build_belief_map.py --full   # full rebuild (~30s)
-python3 scripts/build_belief_map.py ./drive  # single sub-repo
-python3 scripts/build_belief_map.py --lsp    # with LSP call hierarchy (~1-5min)
+python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT"
+python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --full
+python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --lsp
+python3 "$SKILL_ROOT/scripts/build_belief_map.py" \
+  --root "$TARGET_ROOT" --output "$TARGET_ROOT/custom-map.sexp"
 ```
 
 Rebuild after structural changes (add/remove files, change imports, add classes).
+Search patterns support literals, `.*`, boundary `^`/`$` anchors, and
+backslash escapes. Other regex operators are rejected.
+
+The TypeScript AST contract covers TS/TSX imports and re-exports, literal
+`import()`/`require()`, `import = require()`, literal template imports, emitted
+`.js`/`.jsx` specifiers, project-scoped path aliases, and conventional exact
+self-imports. It does not promise inherited `tsconfig` aliases,
+`baseUrl`-only resolution, package `source`/`exports`, or self-package export
+subpaths.
 
 ## Infrastructure Topology
 

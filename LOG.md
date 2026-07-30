@@ -1,3 +1,30 @@
+## 2026-07-30
+
+### Changes
+- Added regression coverage for completion-order stability, module-ID
+  collisions, cache provenance, atomic publication, writer locking, explicit
+  roots/output, additional literal TypeScript imports, quoted paths, malformed
+  maps, unsafe patterns, and invalid depths.
+- Added exact Python dependency pins and explicit builder/query path contracts.
+
+### Fixes
+- Resolved `CALLS_API` providers through consumer imports and failed closed when
+  an unqualified provider name remained ambiguous.
+- Sorted parsed results and rejected every colliding normalized module ID before
+  cache or map publication.
+- Added cache/map schema validation, builder fingerprints, atomic replacement,
+  and a per-project non-blocking writer lock.
+- Replaced user-controlled regular expressions with a bounded linear pattern
+  grammar and surfaced numeric, source-read, and structural map errors.
+- Encoded unsafe paths as quoted definitions and recognized TypeScript
+  `import = require()` and literal template imports.
+
+### Motivation
+- GitHub issue #1 reproduced silent semantic changes, discarded modules, stale
+  cache trust, unsafe concurrent writes, ambiguous targeting, and unbounded
+  query input. These changes make correctness deterministic and failures local,
+  explicit, and non-destructive.
+
 ## 2026-07-14
 
 ### Changes
@@ -10,7 +37,10 @@
 - Resolved exact package self-imports to the nearest owning package source entrypoint without shadowing installed dependencies.
 
 ### Motivation
-- The Upgraide monorepo compiler oracle now measures 99.899% local dependency recall and 99.832% precision, reducing architecture-query omissions without embedding a complete TypeScript resolver.
+- An author-run external monorepo compiler oracle measured 99.899% local
+  dependency recall and 99.832% precision. The oracle and dataset are not
+  committed here, so this is provenance for the change rather than a
+  reproducible repository benchmark.
 
 ## 2026-07-13
 
@@ -29,7 +59,9 @@
 - Canonicalized the scan root once so macOS path aliases do not leak into module IDs.
 
 ### Motivation
-- The audit findings were reproducible on isolated fixtures and the Upgraide mono workspace; these changes address the smallest correctness blockers while leaving unsupported languages and infrastructure formats explicit.
+- The audit findings were reproducible on isolated fixtures and a large
+  polyrepo workspace; these changes address the smallest correctness blockers
+  while leaving unsupported languages and infrastructure formats explicit.
 
 ## 2026-07-12
 

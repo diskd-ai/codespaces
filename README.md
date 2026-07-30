@@ -48,7 +48,7 @@ Run from the skill's base directory: `python3 scripts/belief_search.py <command>
 
 | Command | Purpose |
 |---------|---------|
-| `search "<pattern>"` | Regex grep on the graph to find module IDs |
+| `search "<pattern>"` | Safe literal/`.*` pattern search for module IDs |
 | `analyze <id>` | Full module analysis (PRIMARY command) |
 | `quick <keyword>` | Search + analyze the first match (shortcut) |
 | `boundary <id>` | Files to read for a change |
@@ -81,14 +81,40 @@ All output is S-expression facts, one per line.
 
 1. **Locate or build the map**: check for `.belief_map.sexp`; if absent, build it
    ```bash
-   pip3 install tree-sitter tree-sitter-typescript tree-sitter-python
-   python3 scripts/build_belief_map.py          # incremental ~5s
-   python3 scripts/build_belief_map.py --full   # full rebuild ~30s
+   SKILL_ROOT="$(pwd -P)"
+   TARGET_ROOT="$(cd /absolute/path/to/project && pwd -P)"
+   python3 -m pip install -r "$SKILL_ROOT/requirements.txt"
+   python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT"
+   python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --full
    ```
 2. **Find the module ID**: `search "keyword"` or `entity EntityName` (IDs are full relative paths, never short codes -- never guess them)
 3. **Analyze**: `analyze <module-id>` returns boundary files, deps, rdeps, layer, and violations
 4. **Read only the boundary files** listed in the analyze output -- not entire directories
 5. **Verify after changes**: re-run `boundaries <id>` to confirm no new violations
+
+---
+
+## TypeScript Resolution Contract
+
+The AST pass supports TypeScript and TSX static imports, type-only and
+side-effect imports, named/star/type re-exports, literal `import()`, literal
+`require()`, `import = require()`, literal template imports, emitted
+`.js`/`.jsx` specifiers, project-scoped `paths` aliases, and conventional exact
+package self-imports.
+
+It does not claim full Node/TypeScript resolver parity. Inherited `tsconfig`
+aliases, `baseUrl`-only imports, package `source`/`exports` entrypoints, and
+self-package export subpaths require LSP enrichment or direct source
+verification.
+
+Custom output locations can be queried explicitly:
+
+```bash
+python3 "$SKILL_ROOT/scripts/belief_search.py" \
+  --map /absolute/path/to/map.sexp \
+  --root "$TARGET_ROOT" \
+  analyze module/id
+```
 
 ---
 
@@ -151,7 +177,7 @@ Query: rg 'data-flow' .belief_map.sexp ; then refs-to "DrivePath"
 Render a Mermaid flowchart showing where data is produced -> validated -> consumed.
 ```
 
-Tip: build the map with `--lsp` first (`python3 scripts/build_belief_map.py --lsp`) for precise call-site edges -- sequence diagrams come out much sharper.
+Tip: add `--lsp` to the explicit-root build command for precise call-site edges -- sequence diagrams come out much sharper.
 
 ---
 
@@ -190,7 +216,7 @@ codespaces/
 ## Best Practices
 
 ### Finding Modules
-* Use `search` with a broad regex first, then narrow with the returned full path.
+* Use `search` with literal text or a broad `.*` pattern first, then narrow with the returned full path. Patterns support literals, `.*`, boundary `^`/`$` anchors, and backslash escapes; other regex operators are rejected.
 * On `(error no-match ...)`, do not retry the same ID -- broaden the search and use the `:suggestions` field if present.
 
 ### Analyzing Impact
