@@ -18,7 +18,7 @@ Usage::
     belief_search.py rdeps <id> [depth]     Reverse dependency tree (default depth 2)
     belief_search.py entity <name>          Find entity: definition + all usages
     belief_search.py flow <id> <entity>     Trace data/call flow from entity
-    belief_search.py search <pattern>       Regex search across all facts
+    belief_search.py search <pattern>       Safe pattern search across all facts
     belief_search.py invariants [scope]     Check naming-convention violations (default: all)
     belief_search.py find_function <name>   Find function/method definitions by name
     belief_search.py find_type <name>       Find type/class/interface/enum definitions by name
@@ -50,6 +50,9 @@ CLI examples::
     belief_search.py find_calls createOrder 2
     belief_search.py grep_functions "validate.*input"
     belief_search.py diff_functions HEAD~3
+
+Patterns support literal text, ``.*`` wildcards, boundary ``^``/``$`` anchors,
+and backslash escapes. Other regex operators are rejected.
 """
 
 from __future__ import annotations
@@ -59,11 +62,55 @@ import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Optional
+
+MAP_SCHEMA_VERSION = 1
+MAX_SEARCH_PATTERN_LENGTH = 256
+MAX_QUERY_DEPTH = 50
 
 
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SearchPattern:
+    segments: tuple[str, ...]
+    anchor_start: bool
+    anchor_end: bool
+
+
+@dataclass(frozen=True)
+class SearchPatternOk:
+    value: SearchPattern
+
+
+@dataclass(frozen=True)
+class SearchPatternErr:
+    error: str
+
+
+SearchPatternResult = SearchPatternOk | SearchPatternErr
+
+
+@dataclass(frozen=True)
+class MapLoadOk:
+    pass
+
+
+@dataclass(frozen=True)
+class MapLoadErr:
+    error: str
+
+
+MapLoadResult = MapLoadOk | MapLoadErr
+
+
+@dataclass(frozen=True)
+class QueryError:
+    kind: str
+    message: str
+
 
 @dataclass
 class Node:
@@ -91,6 +138,95 @@ class Edge:
     source: str
     target: str
     flags: list[str] = field(default_factory=list)
+
+
+def parse_search_pattern(raw: str) -> SearchPatternResult:
+    """Parse the supported linear pattern grammar without regex execution."""
+    if len(raw) > MAX_SEARCH_PATTERN_LENGTH:
+        return SearchPatternErr(
+            f"pattern exceeds {MAX_SEARCH_PATTERN_LENGTH} characters"
+        )
+
+    anchor_start = raw.startswith("^")
+    body_start = 1 if anchor_start else 0
+    trailing_backslashes = len(raw) - len(raw.rstrip("\\"))
+    anchor_end = raw.endswith("$") and trailing_backslashes % 2 == 0
+    body_end = len(raw) - 1 if anchor_end else len(raw)
+    body = raw[body_start:body_end]
+
+    segments: list[str] = []
+    literal: list[str] = []
+    index = 0
+    unsupported = set("[](){}+?|")
+    while index < len(body):
+        character = body[index]
+        if character == "\\":
+            if index + 1 >= len(body):
+                return SearchPatternErr("pattern ends with an incomplete escape")
+            literal.append(body[index + 1])
+            index += 2
+            continue
+        if character == "." and index + 1 < len(body) and body[index + 1] == "*":
+            segments.append("".join(literal).casefold())
+            literal = []
+            index += 2
+            continue
+        if character == "*" or character in unsupported:
+            return SearchPatternErr(
+                f"unsupported pattern operator: {character}"
+            )
+        if character in ("^", "$"):
+            return SearchPatternErr(
+                f"{character} is only supported at the pattern boundary"
+            )
+        literal.append(character)
+        index += 1
+
+    segments.append("".join(literal).casefold())
+    return SearchPatternOk(SearchPattern(
+        segments=tuple(segments),
+        anchor_start=anchor_start,
+        anchor_end=anchor_end,
+    ))
+
+
+def search_pattern_matches(pattern: SearchPattern, value: str) -> bool:
+    """Match literal segments and ``.*`` wildcards in linear time."""
+    candidate = value.casefold()
+    position = 0
+    final_index = len(pattern.segments) - 1
+    for index, segment in enumerate(pattern.segments):
+        if index == final_index and pattern.anchor_end:
+            match_position = len(candidate) - len(segment)
+            return (
+                match_position >= position
+                and candidate[match_position:] == segment
+                and (not pattern.anchor_start or index > 0 or match_position == 0)
+            )
+        if index == 0 and pattern.anchor_start:
+            if not candidate.startswith(segment):
+                return False
+            match_position = 0
+        else:
+            match_position = candidate.find(segment, position)
+            if match_position < 0:
+                return False
+        position = match_position + len(segment)
+    return True
+
+
+def _parse_depth(raw: str) -> tuple[Optional[int], Optional[str]]:
+    try:
+        depth = int(raw)
+    except ValueError:
+        return None, f"depth must be an integer: {raw}"
+    if depth < 0 or depth > MAX_QUERY_DEPTH:
+        return None, f"depth must be between 0 and {MAX_QUERY_DEPTH}: {raw}"
+    return depth, None
+
+
+def _print_invalid_pattern(raw: str, error: str) -> None:
+    print(f"(error invalid-pattern {_q(raw)} {_q(error)})")
 
 
 # ---------------------------------------------------------------------------
@@ -223,55 +359,102 @@ class BeliefGraph:
         self.pmap: dict[str, str] = {}
         self._root: str = ""
 
-    def load(self, path: str) -> None:
-        self._root = os.path.dirname(os.path.abspath(path))
+    def load(self, path: str, root: Optional[str] = None) -> MapLoadResult:
+        self.nodes = {}
+        self.entities = {}
+        self.entity_by_name = {}
+        self.edges_from = {}
+        self.edges_to = {}
+        self.edges_from_entity = {}
+        self.edges_by_entity_name = {}
+        self.all_edges = []
+        self.pmap = {}
+        self._root = os.path.abspath(
+            root if root is not None else os.path.dirname(os.path.abspath(path))
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as belief_map:
+                map_lines = belief_map.readlines()
+        except OSError as error:
+            return MapLoadErr(f"could not read {path}: {error}")
+
         pmap: dict[str, str] = {}
+        declared_node_count: Optional[int] = None
+        found_header = False
+        found_paths = False
 
         in_paths = False
         path_stack: list[str] = []
 
-        with open(path, "r") as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped or stripped.startswith(";"):
-                    continue
+        for line in map_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                continue
 
-                if stripped == "(paths":
-                    in_paths = True
-                    path_stack = []
-                    continue
+            header_tokens = tokenize(stripped)
+            if header_tokens and header_tokens[0] == "belief-map":
+                found_header = True
+                try:
+                    schema_index = header_tokens.index(":schema")
+                    nodes_index = header_tokens.index(":nodes")
+                except ValueError:
+                    return MapLoadErr("belief-map header is missing schema or node count")
+                if schema_index + 1 >= len(header_tokens):
+                    return MapLoadErr("belief-map header has no schema value")
+                if header_tokens[schema_index + 1] != str(MAP_SCHEMA_VERSION):
+                    return MapLoadErr(
+                        f"unsupported belief-map schema: "
+                        f"{header_tokens[schema_index + 1]}"
+                    )
+                if (
+                    nodes_index + 1 >= len(header_tokens)
+                    or not header_tokens[nodes_index + 1].isdigit()
+                ):
+                    return MapLoadErr("belief-map header has an invalid node count")
+                declared_node_count = int(header_tokens[nodes_index + 1])
+                continue
 
-                if in_paths:
-                    if stripped == ")":
-                        if path_stack:
-                            path_stack.pop()
-                        else:
-                            in_paths = False
-                        continue
+            if stripped == "(paths":
+                found_paths = True
+                in_paths = True
+                path_stack = []
+                continue
 
-                    tokens = tokenize(stripped)
-                    if not tokens:
-                        inner = stripped.lstrip("(").rstrip()
-                        if inner:
-                            path_stack.append(inner)
-                        continue
-
-                    if len(tokens) == 2 and not tokens[0].startswith(":"):
-                        sid, leaf = tokens[0], tokens[1]
-                        if leaf == ":self":
-                            # Directory-as-module (index.ts stripped to dir name)
-                            full = "/".join(path_stack) if path_stack else sid
-                            pmap[sid] = full
-                        else:
-                            full = "/".join(path_stack + [leaf]) if path_stack else leaf
-                            pmap[sid] = full
-                    elif len(tokens) == 1:
-                        path_stack.append(tokens[0])
+            if in_paths:
+                if stripped == ")":
+                    if path_stack:
+                        path_stack.pop()
+                    else:
+                        in_paths = False
                     continue
 
                 tokens = tokenize(stripped)
-                if tokens and tokens[0] == "def" and len(tokens) >= 3:
-                    pmap[tokens[1]] = tokens[2]
+                if not tokens:
+                    inner = stripped.lstrip("(").rstrip()
+                    if inner:
+                        path_stack.append(inner)
+                    continue
+
+                if len(tokens) == 2 and not tokens[0].startswith(":"):
+                    sid, leaf = tokens[0], tokens[1]
+                    if leaf == ":self":
+                        full = "/".join(path_stack) if path_stack else sid
+                        pmap[sid] = full
+                    else:
+                        full = "/".join(path_stack + [leaf]) if path_stack else leaf
+                        pmap[sid] = full
+                elif len(tokens) == 1:
+                    path_stack.append(tokens[0])
+                continue
+
+            tokens = tokenize(stripped)
+            if tokens and tokens[0] == "def" and len(tokens) >= 3:
+                pmap[tokens[1]] = tokens[2]
+
+        if not found_header:
+            return MapLoadErr("belief-map header is missing")
+        if not found_paths or in_paths:
+            return MapLoadErr("belief-map path section is missing or unbalanced")
 
         self.pmap = pmap
 
@@ -281,65 +464,71 @@ class BeliefGraph:
                 return f"{pmap.get(mod, mod)}::{ent}"
             return pmap.get(sid, sid)
 
-        with open(path, "r") as f:
-            for line in f:
-                tokens = tokenize(line)
-                if not tokens:
-                    continue
-                kind = tokens[0]
+        for line in map_lines:
+            tokens = tokenize(line)
+            if not tokens:
+                continue
+            kind = tokens[0]
 
-                if kind in ("paths", "def", ")"):
-                    continue
+            if kind in ("belief-map", "paths", "def", ")"):
+                continue
 
-                if kind == "node" and len(tokens) >= 4:
-                    nid = _resolve(tokens[1])
-                    lang, purpose = tokens[2], tokens[3]
-                    naming, pkg = "", ""
-                    rest = tokens[4:]
-                    for i, t in enumerate(rest):
-                        if t == ":naming" and i + 1 < len(rest):
-                            naming = rest[i + 1]
-                        elif t == ":pkg" and i + 1 < len(rest):
-                            pkg = rest[i + 1]
-                    self.nodes[nid] = Node(nid, lang, purpose, naming, pkg)
+            if kind == "node" and len(tokens) >= 4:
+                nid = _resolve(tokens[1])
+                lang, purpose = tokens[2], tokens[3]
+                naming, pkg = "", ""
+                rest = tokens[4:]
+                for i, t in enumerate(rest):
+                    if t == ":naming" and i + 1 < len(rest):
+                        naming = rest[i + 1]
+                    elif t == ":pkg" and i + 1 < len(rest):
+                        pkg = rest[i + 1]
+                self.nodes[nid] = Node(nid, lang, purpose, naming, pkg)
 
-                elif kind in ("fn", "cls", "ifc", "typ", "enm") and len(tokens) >= 4:
-                    module = _resolve(tokens[1])
-                    name = tokens[2]
-                    line_num = int(tokens[3]) if tokens[3].isdigit() else 0
-                    bases, deco, methods = [], [], []
-                    for t in tokens[4:]:
-                        if t.startswith("(:bases"):
-                            bases = parse_sub_list(t)
-                        elif t.startswith("(:deco"):
-                            deco = parse_sub_list(t)
-                        elif t.startswith("(:methods"):
-                            methods = parse_sub_list(t)
-                    ent = EntityFact(module, name, kind, line_num, bases, deco, methods)
-                    self.entities.setdefault(module, []).append(ent)
-                    self.entity_by_name.setdefault(name, []).append(ent)
+            elif kind in ("fn", "cls", "ifc", "typ", "enm") and len(tokens) >= 4:
+                module = _resolve(tokens[1])
+                name = tokens[2]
+                line_num = int(tokens[3]) if tokens[3].isdigit() else 0
+                bases, deco, methods = [], [], []
+                for t in tokens[4:]:
+                    if t.startswith("(:bases"):
+                        bases = parse_sub_list(t)
+                    elif t.startswith("(:deco"):
+                        deco = parse_sub_list(t)
+                    elif t.startswith("(:methods"):
+                        methods = parse_sub_list(t)
+                ent = EntityFact(module, name, kind, line_num, bases, deco, methods)
+                self.entities.setdefault(module, []).append(ent)
+                self.entity_by_name.setdefault(name, []).append(ent)
 
-                elif kind in ("imports", "calls-api", "data-flow", "refs", "calls", "http-calls") and len(tokens) >= 3:
-                    source = _resolve(tokens[1])
-                    target = _resolve(tokens[2])
-                    flags = [t for t in tokens[3:] if t.startswith(":")]
-                    edge = Edge(kind, source, target, flags)
-                    self.all_edges.append(edge)
-                    src_mod = source.split("::")[0]
-                    tgt_mod = target.split("::")[0]
-                    self.edges_from.setdefault(src_mod, []).append(edge)
-                    self.edges_to.setdefault(tgt_mod, []).append(edge)
-                    self.edges_from_entity.setdefault(source, []).append(edge)
-                    for part in (source, target):
-                        if "::" in part:
-                            ent_name = part.split("::", 1)[1]
-                            self.edges_by_entity_name.setdefault(ent_name, []).append(edge)
+            elif kind in ("imports", "calls-api", "data-flow", "refs", "calls", "http-calls") and len(tokens) >= 3:
+                source = _resolve(tokens[1])
+                target = _resolve(tokens[2])
+                flags = [t for t in tokens[3:] if t.startswith(":")]
+                edge = Edge(kind, source, target, flags)
+                self.all_edges.append(edge)
+                src_mod = source.split("::")[0]
+                tgt_mod = target.split("::")[0]
+                self.edges_from.setdefault(src_mod, []).append(edge)
+                self.edges_to.setdefault(tgt_mod, []).append(edge)
+                self.edges_from_entity.setdefault(source, []).append(edge)
+                for part in (source, target):
+                    if "::" in part:
+                        ent_name = part.split("::", 1)[1]
+                        self.edges_by_entity_name.setdefault(ent_name, []).append(edge)
 
-                elif kind == "violation" and len(tokens) >= 5:
-                    source = _resolve(tokens[2])
-                    target = _resolve(tokens[3])
-                    edge = Edge("violation", source, target, [f":rule={tokens[1]}"])
-                    self.all_edges.append(edge)
+            elif kind == "violation" and len(tokens) >= 5:
+                source = _resolve(tokens[2])
+                target = _resolve(tokens[3])
+                edge = Edge("violation", source, target, [f":rule={tokens[1]}"])
+                self.all_edges.append(edge)
+
+        if declared_node_count != len(self.nodes):
+            return MapLoadErr(
+                f"belief-map node count mismatch: expected "
+                f"{declared_node_count}, loaded {len(self.nodes)}"
+            )
+        return MapLoadOk()
 
     def resolve_alias(self, module_id: str) -> str:
         """Resolve an internal path-map alias to a module ID when possible."""
@@ -378,12 +567,12 @@ class BeliefGraph:
             return sorted(ci_matches)
         return []
 
-    def search_modules(self, pattern: str) -> list[str]:
-        """Find module IDs whose path or basename matches the regex pattern."""
-        regex = re.compile(pattern, re.IGNORECASE)
+    def search_modules(self, pattern: SearchPattern) -> list[str]:
+        """Find module IDs whose path or basename matches a safe pattern."""
         matches = [
             nid for nid in self.nodes
-            if regex.search(nid) or regex.search(nid.rsplit("/", 1)[-1])
+            if search_pattern_matches(pattern, nid)
+            or search_pattern_matches(pattern, nid.rsplit("/", 1)[-1])
         ]
         return sorted(matches)
 
@@ -773,14 +962,17 @@ def cmd_rdeps(g: BeliefGraph, module_id: str, max_depth: int) -> None:
 
 
 def cmd_entity(g: BeliefGraph, name: str) -> None:
-    # Always try exact match first, then regex fallback
+    # Always try exact match first, then safe-pattern fallback.
     definitions: list[EntityFact] = []
     if name in g.entity_by_name:
         definitions = g.entity_by_name[name]
     else:
-        pattern = re.compile(name, re.IGNORECASE)
+        parsed_pattern = parse_search_pattern(name)
+        if isinstance(parsed_pattern, SearchPatternErr):
+            _print_invalid_pattern(name, parsed_pattern.error)
+            return
         for ename, ents in g.entity_by_name.items():
-            if pattern.search(ename):
+            if search_pattern_matches(parsed_pattern.value, ename):
                 definitions.extend(ents)
 
     if not definitions:
@@ -1038,7 +1230,7 @@ def cmd_quick(g: BeliefGraph, keyword: str, sexp_path: str) -> None:
 
     Resolution order:
     1. resolve_module (exact/suffix/substring/case-insensitive)
-    2. Regex search across the raw sexp file, extract module IDs from matches
+    2. Literal search across the raw sexp file, extract module IDs from matches
 
     Runs cmd_analyze on the first unique module found.
     """
@@ -1075,18 +1267,24 @@ def cmd_quick(g: BeliefGraph, keyword: str, sexp_path: str) -> None:
 
 def cmd_search(_g: BeliefGraph, pattern: str, sexp_path: str) -> None:
     """Search module IDs first, then fall back to raw fact grep."""
-    module_matches = _g.search_modules(pattern)
+    parsed_pattern = parse_search_pattern(pattern)
+    if isinstance(parsed_pattern, SearchPatternErr):
+        _print_invalid_pattern(pattern, parsed_pattern.error)
+        return
+    module_matches = _g.search_modules(parsed_pattern.value)
     if module_matches:
         for nid in module_matches:
             print(f"(result {nid})")
         print(f"(result-count {len(module_matches)})")
         return
 
-    regex = re.compile(pattern, re.IGNORECASE)
-    with open(sexp_path, "r") as f:
-        for line in f:
-            if regex.search(line):
-                print(line.rstrip())
+    try:
+        with open(sexp_path, "r", encoding="utf-8") as belief_map:
+            for line in belief_map:
+                if search_pattern_matches(parsed_pattern.value, line):
+                    print(line.rstrip())
+    except OSError as error:
+        print(f"(error search-read-failed {_q(str(error))})")
 
 
 def cmd_boundaries(g: BeliefGraph, module_id: str) -> None:
@@ -1234,15 +1432,21 @@ def cmd_invariants(g: BeliefGraph, scope: str) -> None:
 def cmd_find_function(g: BeliefGraph, name: str) -> None:
     """Find function/method definitions matching a name pattern.
 
-    Searches fn entities and cls methods. Exact match first, then regex.
+    Searches fn entities and cls methods. Exact match first, then safe pattern.
     """
-    pattern = re.compile(name, re.IGNORECASE)
+    parsed_pattern = parse_search_pattern(name)
+    if isinstance(parsed_pattern, SearchPatternErr):
+        _print_invalid_pattern(name, parsed_pattern.error)
+        return
     results: list[tuple[EntityFact, str]] = []
 
     for ent_name, ent_list in g.entity_by_name.items():
         for ent in ent_list:
             if ent.kind == "fn":
-                if ent_name == name or pattern.search(ent_name):
+                if (
+                    ent_name == name
+                    or search_pattern_matches(parsed_pattern.value, ent_name)
+                ):
                     results.append((ent, ""))
 
     # Also search methods inside classes
@@ -1250,7 +1454,10 @@ def cmd_find_function(g: BeliefGraph, name: str) -> None:
         for ent in ent_list:
             if ent.kind == "cls" and ent.methods:
                 for method in ent.methods:
-                    if method == name or pattern.search(method):
+                    if (
+                        method == name
+                        or search_pattern_matches(parsed_pattern.value, method)
+                    ):
                         results.append((ent, method))
 
     if not results:
@@ -1278,13 +1485,19 @@ def cmd_find_type(g: BeliefGraph, name: str) -> None:
 
     Searches cls, ifc, typ, enm entities.
     """
-    pattern = re.compile(name, re.IGNORECASE)
+    parsed_pattern = parse_search_pattern(name)
+    if isinstance(parsed_pattern, SearchPatternErr):
+        _print_invalid_pattern(name, parsed_pattern.error)
+        return
     results: list[EntityFact] = []
 
     for ent_name, ent_list in g.entity_by_name.items():
         for ent in ent_list:
             if ent.kind in ("cls", "ifc", "typ", "enm"):
-                if ent_name == name or pattern.search(ent_name):
+                if (
+                    ent_name == name
+                    or search_pattern_matches(parsed_pattern.value, ent_name)
+                ):
                     results.append(ent)
 
     if not results:
@@ -1516,12 +1729,15 @@ def cmd_find_callchain(g: BeliefGraph, src_fn: str, tgt_fn: str, max_depth: int)
 
 
 def cmd_grep_functions(g: BeliefGraph, pattern: str) -> None:
-    """Search function bodies in source files for a regex pattern.
+    """Search function bodies using the supported linear pattern grammar.
 
     For each function in the belief map, reads the source file and searches
     the function body (from definition line to next entity or EOF).
     """
-    regex = re.compile(pattern, re.IGNORECASE)
+    parsed_pattern = parse_search_pattern(pattern)
+    if isinstance(parsed_pattern, SearchPatternErr):
+        _print_invalid_pattern(pattern, parsed_pattern.error)
+        return
     results: list[tuple[str, str, int, str]] = []  # (module::fn, file, match_line, match_text)
 
     # Group entities by file for efficient reading
@@ -1540,7 +1756,10 @@ def cmd_grep_functions(g: BeliefGraph, pattern: str) -> None:
         try:
             with open(fpath, "r", errors="replace") as f:
                 lines = f.readlines()
-        except OSError:
+        except OSError as error:
+            print(
+                f"(error source-read-failed {_q(fpath)} {_q(str(error))})"
+            )
             continue
 
         # Sort functions by line number to determine body ranges
@@ -1558,7 +1777,7 @@ def cmd_grep_functions(g: BeliefGraph, pattern: str) -> None:
 
             for line_idx in range(start, end):
                 line = lines[line_idx]
-                if regex.search(line):
+                if search_pattern_matches(parsed_pattern.value, line):
                     results.append((
                         f"{mod}::{ent.name}",
                         fpath,
@@ -1750,7 +1969,7 @@ _QUERY_HELP = """\
 ;   (intersect A B)                    Set intersection
 ;   (union A B ...)                    Set union
 ;   (diff A B)                         A minus B
-;   (filter SET "pattern")             Keep members matching regex
+;   (filter SET "pattern")             Keep members matching safe pattern
 ;
 ; Output:
 ;   (files SET)                        Resolve to file paths
@@ -1857,6 +2076,9 @@ class _SchemeEval:
 
         # Evaluate args (eager)
         evaled = [self._eval(a) for a in args]
+        for value in evaled:
+            if isinstance(value, QueryError):
+                return value
 
         return self._apply(head, evaled)
 
@@ -1869,7 +2091,11 @@ class _SchemeEval:
 
         if fn == "deps":
             pattern = str(args[0]) if args else ""
-            depth = int(str(args[1])) if len(args) > 1 else 2
+            depth, depth_error = (
+                _parse_depth(str(args[1])) if len(args) > 1 else (2, None)
+            )
+            if depth_error is not None or depth is None:
+                return QueryError("invalid-depth", depth_error or "invalid depth")
             matches = g.resolve_module(pattern)
             result: set[str] = set()
             for m in matches:
@@ -1879,7 +2105,11 @@ class _SchemeEval:
 
         if fn == "rdeps":
             pattern = str(args[0]) if args else ""
-            depth = int(str(args[1])) if len(args) > 1 else 1
+            depth, depth_error = (
+                _parse_depth(str(args[1])) if len(args) > 1 else (1, None)
+            )
+            if depth_error is not None or depth is None:
+                return QueryError("invalid-depth", depth_error or "invalid depth")
             matches = g.resolve_module(pattern)
             result = set()
             for m in matches:
@@ -1917,9 +2147,11 @@ class _SchemeEval:
             name = str(args[0]) if args else ""
             defs = g.entity_by_name.get(name, [])
             if not defs:
-                pattern = re.compile(name, re.IGNORECASE)
+                parsed_pattern = parse_search_pattern(name)
+                if isinstance(parsed_pattern, SearchPatternErr):
+                    return QueryError("invalid-pattern", parsed_pattern.error)
                 for ename, ents in g.entity_by_name.items():
-                    if pattern.search(ename):
+                    if search_pattern_matches(parsed_pattern.value, ename):
                         defs.extend(ents)
             return set(d.module for d in defs)
 
@@ -1947,8 +2179,14 @@ class _SchemeEval:
         if fn == "filter":
             s = self._to_set(args[0])
             pattern = str(args[1]) if len(args) > 1 else ""
-            regex = re.compile(pattern, re.IGNORECASE)
-            return {m for m in s if regex.search(m)}
+            parsed_pattern = parse_search_pattern(pattern)
+            if isinstance(parsed_pattern, SearchPatternErr):
+                return QueryError("invalid-pattern", parsed_pattern.error)
+            return {
+                m
+                for m in s
+                if search_pattern_matches(parsed_pattern.value, m)
+            }
 
         if fn == "files":
             s = self._to_set(args[0])
@@ -2001,27 +2239,41 @@ class _SchemeEval:
 
         if fn == "find-function" or fn == "find_function":
             name = str(args[0]) if args else ""
-            pattern = re.compile(name, re.IGNORECASE)
+            parsed_pattern = parse_search_pattern(name)
+            if isinstance(parsed_pattern, SearchPatternErr):
+                return QueryError("invalid-pattern", parsed_pattern.error)
             result: set[str] = set()
             for ent_name, ent_list in g.entity_by_name.items():
                 for ent in ent_list:
-                    if ent.kind == "fn" and (ent_name == name or pattern.search(ent_name)):
+                    if ent.kind == "fn" and (
+                        ent_name == name
+                        or search_pattern_matches(parsed_pattern.value, ent_name)
+                    ):
                         result.add(ent.module)
             return result
 
         if fn == "find-type" or fn == "find_type":
             name = str(args[0]) if args else ""
-            pattern = re.compile(name, re.IGNORECASE)
+            parsed_pattern = parse_search_pattern(name)
+            if isinstance(parsed_pattern, SearchPatternErr):
+                return QueryError("invalid-pattern", parsed_pattern.error)
             result = set()
             for ent_name, ent_list in g.entity_by_name.items():
                 for ent in ent_list:
-                    if ent.kind in ("cls", "ifc", "typ", "enm") and (ent_name == name or pattern.search(ent_name)):
+                    if ent.kind in ("cls", "ifc", "typ", "enm") and (
+                        ent_name == name
+                        or search_pattern_matches(parsed_pattern.value, ent_name)
+                    ):
                         result.add(ent.module)
             return result
 
         if fn == "find-callers" or fn == "find_callers":
             fn_name = str(args[0]) if args else ""
-            depth = int(str(args[1])) if len(args) > 1 else 2
+            depth, depth_error = (
+                _parse_depth(str(args[1])) if len(args) > 1 else (2, None)
+            )
+            if depth_error is not None or depth is None:
+                return QueryError("invalid-depth", depth_error or "invalid depth")
             targets = _resolve_fn_entity(g, fn_name)
             result = set()
             for _qid, ent in targets:
@@ -2039,7 +2291,11 @@ class _SchemeEval:
 
         if fn == "find-calls" or fn == "find_calls":
             fn_name = str(args[0]) if args else ""
-            depth = int(str(args[1])) if len(args) > 1 else 2
+            depth, depth_error = (
+                _parse_depth(str(args[1])) if len(args) > 1 else (2, None)
+            )
+            if depth_error is not None or depth is None:
+                return QueryError("invalid-depth", depth_error or "invalid depth")
             sources = _resolve_fn_entity(g, fn_name)
             result = set()
             src_qualified = {qid for qid, _ in sources}
@@ -2094,7 +2350,9 @@ class _SchemeEval:
 
 def _format_result(val: object) -> None:
     """Print a Scheme query result as S-expression facts."""
-    if isinstance(val, set):
+    if isinstance(val, QueryError):
+        print(f"(error {val.kind} {_q(val.message)})")
+    elif isinstance(val, set):
         for item in sorted(val):
             print(f"(result {_q(item)})")
         if not val:
@@ -2175,21 +2433,92 @@ def find_sexp_file() -> str:
     if json_found:
         print(f"Error: found JSON belief map at {json_found} but this script requires sexp format.", file=sys.stderr)
         print("Rebuild with the sexp builder:", file=sys.stderr)
-        print("  python3 ~/.claude/skills/codespaces/scripts/build_belief_map.py", file=sys.stderr)
+        print(
+            "  python3 /absolute/path/to/codespaces/scripts/"
+            "build_belief_map.py --root /absolute/path/to/project",
+            file=sys.stderr,
+        )
     else:
         print("Error: .belief_map.sexp not found. Run build_belief_map.py first.", file=sys.stderr)
     sys.exit(1)
 
 
-def main() -> None:
-    args = sys.argv[1:]
+def _extract_query_paths(
+    args: list[str],
+) -> tuple[list[str], Optional[str], Optional[str], Optional[str]]:
+    command_args: list[str] = []
+    map_path: Optional[str] = None
+    root: Optional[str] = None
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument in ("--map", "--root"):
+            if index + 1 >= len(args):
+                return [], None, None, f"{argument} requires a value"
+            value = args[index + 1]
+            if not os.path.isabs(value):
+                return [], None, None, f"{argument} must be an absolute path"
+            if argument == "--map":
+                map_path = os.path.realpath(value)
+            else:
+                root = os.path.realpath(value)
+            index += 2
+            continue
+        command_args.append(argument)
+        index += 1
+    return command_args, map_path, root, None
+
+
+def _validate_cli_command(args: list[str]) -> Optional[str]:
+    if not args:
+        return None
+    pattern_commands = {
+        "entity",
+        "search",
+        "find_function",
+        "find_type",
+        "grep_functions",
+    }
+    if args[0] in pattern_commands and len(args) >= 2:
+        pattern_result = parse_search_pattern(args[1])
+        if isinstance(pattern_result, SearchPatternErr):
+            return f"invalid pattern {args[1]}: {pattern_result.error}"
+
+    depth_positions = {
+        "deps": 2,
+        "rdeps": 2,
+        "find_callchain": 3,
+        "find_callers": 2,
+        "find_calls": 2,
+    }
+    depth_position = depth_positions.get(args[0])
+    if depth_position is not None and len(args) > depth_position:
+        _depth, depth_error = _parse_depth(args[depth_position])
+        return depth_error
+    return None
+
+
+def main(args: Optional[list[str]] = None) -> int:
+    raw_args = list(sys.argv[1:] if args is None else args)
+    args, explicit_map, explicit_root, option_error = _extract_query_paths(raw_args)
+    if option_error is not None:
+        print(f"(error invalid-argument {_q(option_error)})")
+        return 2
     if not args or args[0] in ("-h", "--help", "help"):
         print(__doc__)
-        sys.exit(0)
+        return 0
 
-    sexp_path = find_sexp_file()
+    command_error = _validate_cli_command(args)
+    if command_error is not None:
+        print(f"(error invalid-argument {_q(command_error)})")
+        return 2
+
+    sexp_path = explicit_map or find_sexp_file()
     g = BeliefGraph()
-    g.load(sexp_path)
+    load_result = g.load(sexp_path, explicit_root)
+    if isinstance(load_result, MapLoadErr):
+        print(f"(error invalid-map {_q(load_result.error)})")
+        return 1
 
     cmd = args[0]
     if cmd == "analyze" and len(args) >= 2:
@@ -2249,8 +2578,9 @@ def main() -> None:
         print("; Commands: analyze, boundary, quick, boundaries, layers, invariants, module, deps, rdeps, entity, flow, search,")
         print(";          find_function, find_type, find_callchain, find_callers, find_calls, grep_functions, diff_functions,")
         print(";          query, repl")
-        sys.exit(1)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

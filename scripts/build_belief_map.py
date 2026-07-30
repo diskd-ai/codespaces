@@ -49,7 +49,7 @@ Requirements
 ------------
 ::
 
-    pip3 install tree-sitter tree-sitter-typescript tree-sitter-python
+    python3 -m pip install -r requirements.txt
 
 Optional for ``--lsp``: ``typescript-language-server``, ``pyright-langserver``.
 
@@ -57,31 +57,46 @@ Usage
 -----
 ::
 
-    python3 scripts/build_belief_map.py              # incremental (~5-8s)
-    python3 scripts/build_belief_map.py --full        # full rebuild
-    python3 scripts/build_belief_map.py --lsp         # with call hierarchy
-    python3 scripts/build_belief_map.py ./app-service  # target sub-repo
+    python3 /absolute/path/to/scripts/build_belief_map.py \
+        --root /absolute/path/to/project
+    python3 /absolute/path/to/scripts/build_belief_map.py \
+        --root /absolute/path/to/project --full
+    python3 /absolute/path/to/scripts/build_belief_map.py \
+        --root /absolute/path/to/project --lsp
 """
 
 from __future__ import annotations
 
 import ast
+import fcntl
 import hashlib
+import importlib.metadata
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Generic, Optional, TypeVar
 from urllib.parse import quote, unquote
 
-import tree_sitter_typescript as _tst
-from tree_sitter import Language as _TsLanguage, Parser as _TsParser
+try:
+    import tree_sitter_typescript as _tst
+    from tree_sitter import Language as _TsLanguage, Parser as _TsParser
+except ModuleNotFoundError as dependency_error:
+    print(
+        f"Error: missing Python dependency {dependency_error.name}. "
+        "Install pinned dependencies with "
+        "`python3 -m pip install -r requirements.txt`.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from None
 
 _TS_LANG = _TsLanguage(_tst.language_typescript())
 _TSX_LANG = _TsLanguage(_tst.language_tsx())
@@ -99,6 +114,9 @@ SKIP_DIRS = {
 
 CACHE_FILE = ".belief_map_cache.json"
 OUTPUT_FILE = ".belief_map.sexp"
+CACHE_SCHEMA_VERSION = 1
+MAP_SCHEMA_VERSION = 1
+BUILDER_CONFIG_VERSION = "2026-07-30"
 
 # Default timeout for LSP requests (seconds)
 LSP_REQUEST_TIMEOUT = 15.0
@@ -120,6 +138,23 @@ KEBAB_CASE_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+E = TypeVar("E")
+
+
+@dataclass(frozen=True)
+class Ok(Generic[T]):
+    value: T
+
+
+@dataclass(frozen=True)
+class Err(Generic[E]):
+    error: E
+
+
+Result = Ok[T] | Err[E]
+
 
 @dataclass
 class Entity:
@@ -173,6 +208,23 @@ class FileResult:
     entities: list[dict]          # Entity.to_dict() results
     imported_names: list[dict]    # ImportedName.to_dict() results
     exported_names: list[str]     # names exported from this file
+
+
+@dataclass(frozen=True)
+class NodeIdCollision:
+    node_id: str
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GraphBuildError:
+    collisions: tuple[NodeIdCollision, ...]
+
+
+@dataclass(frozen=True)
+class GraphBuildOutput:
+    nodes: list[dict]
+    edges: list[dict]
 
 
 @dataclass
@@ -1028,17 +1080,39 @@ def _ts_dependency_specifiers(root) -> list[str]:  # type: ignore[no-untyped-def
     dependencies: list[str] = []
     seen: set[str] = set()
 
-    def _append_string(node) -> None:  # type: ignore[no-untyped-def]
-        if node is None or node.type != "string" or not node.text:
+    def _append_literal(node) -> None:  # type: ignore[no-untyped-def]
+        if node is None or not node.text:
             return
-        specifier = node.text.decode("utf-8").strip("'\"")
+        if node.type == "string":
+            specifier = node.text.decode("utf-8").strip("'\"")
+        elif node.type == "template_string":
+            if any(
+                child.type == "template_substitution"
+                for child in node.named_children
+            ):
+                return
+            specifier = node.text.decode("utf-8").strip("`")
+        else:
+            return
         if specifier and specifier not in seen:
             seen.add(specifier)
             dependencies.append(specifier)
 
     def _visit(node) -> None:  # type: ignore[no-untyped-def]
         if node.type in ("import_statement", "export_statement"):
-            _append_string(node.child_by_field_name("source"))
+            source = node.child_by_field_name("source")
+            if source is None and node.type == "import_statement":
+                import_require = next(
+                    (
+                        child
+                        for child in node.named_children
+                        if child.type == "import_require_clause"
+                    ),
+                    None,
+                )
+                if import_require is not None:
+                    source = import_require.child_by_field_name("source")
+            _append_literal(source)
         elif node.type == "call_expression":
             function = node.child_by_field_name("function")
             function_name = (
@@ -1050,7 +1124,7 @@ def _ts_dependency_specifiers(root) -> list[str]:  # type: ignore[no-untyped-def
                 arguments = node.child_by_field_name("arguments")
                 if arguments is not None:
                     first_argument = next(iter(arguments.named_children), None)
-                    _append_string(first_argument)
+                    _append_literal(first_argument)
 
         for child in node.named_children:
             _visit(child)
@@ -1317,21 +1391,144 @@ def discover_files(root: str) -> list[tuple[str, str, str]]:
 # Incremental cache
 # ---------------------------------------------------------------------------
 
-def load_cache(root: str) -> dict:
-    cache_path = os.path.join(root, CACHE_FILE)
-    if os.path.exists(cache_path):
+def _builder_fingerprint() -> str:
+    """Fingerprint parser code, dependencies, and behavior-affecting config."""
+    dependency_versions = "|".join(
+        f"{name}={importlib.metadata.version(name)}"
+        for name in ("tree-sitter", "tree-sitter-typescript")
+    )
+    config = "|".join(
+        (
+            BUILDER_CONFIG_VERSION,
+            dependency_versions,
+            ",".join(sorted(SKIP_DIRS)),
+        )
+    )
+    digest = hashlib.sha256()
+    digest.update(config.encode("utf-8"))
+    with open(__file__, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_write_text(path: str, content: str) -> None:
+    """Atomically replace a text file after durable same-directory staging."""
+    directory = os.path.dirname(os.path.abspath(path))
+    descriptor, temporary_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        directory_descriptor = os.open(directory, os.O_RDONLY)
         try:
-            with open(cache_path, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            print(f"[belief-map] WARNING: could not load cache {cache_path}: {exc}", file=sys.stderr)
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError:
+        if os.path.exists(temporary_path):
+            try:
+                os.unlink(temporary_path)
+            except OSError as cleanup_error:
+                print(
+                    f"[belief-map] ERROR: could not remove {temporary_path}: "
+                    f"{cleanup_error}",
+                    file=sys.stderr,
+                )
+        raise
+
+
+def load_cache(root: str) -> dict:
+    """Load compatible cache entries or rebuild with an explicit warning."""
+    cache_path = os.path.join(root, CACHE_FILE)
+    if not os.path.exists(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as cache_file:
+            cache = json.load(cache_file)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(
+            f"[belief-map] WARNING: could not load cache {cache_path}: {exc}; "
+            "rebuilding",
+            file=sys.stderr,
+        )
+        return {}
+
+    if not isinstance(cache, dict):
+        print(
+            f"[belief-map] WARNING: incompatible cache {cache_path}: "
+            "top-level value must be an object; rebuilding",
+            file=sys.stderr,
+        )
+        return {}
+    expected_fingerprint = _builder_fingerprint()
+    if (
+        cache.get("schema_version") != CACHE_SCHEMA_VERSION
+        or cache.get("builder_fingerprint") != expected_fingerprint
+        or not isinstance(cache.get("entries"), dict)
+    ):
+        print(
+            f"[belief-map] WARNING: incompatible cache {cache_path}: "
+            "schema or builder fingerprint changed; rebuilding",
+            file=sys.stderr,
+        )
+        return {}
+    entries = cache["entries"]
+    if isinstance(entries, dict):
+        return entries
     return {}
 
 
-def save_cache(root: str, cache: dict):
+def save_cache(root: str, entries: dict) -> None:
     cache_path = os.path.join(root, CACHE_FILE)
-    with open(cache_path, "w") as f:
-        json.dump(cache, f)
+    cache = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "builder_fingerprint": _builder_fingerprint(),
+        "entries": entries,
+    }
+    serialized = json.dumps(cache, sort_keys=True, separators=(",", ":")) + "\n"
+    _atomic_write_text(cache_path, serialized)
+
+
+def decode_cache_entry(entry: object) -> Result[FileResult, str]:
+    """Validate a cached parse result at the persistence boundary."""
+    if not isinstance(entry, dict):
+        return Err("cache entry must be an object")
+    raw_result = entry.get("result")
+    if not isinstance(raw_result, dict):
+        return Err("cache entry result must be an object")
+
+    string_fields = ("path", "language", "repo", "content_hash", "purpose", "naming_convention")
+    for field_name in string_fields:
+        if not isinstance(raw_result.get(field_name), str):
+            return Err(f"cache result field {field_name} must be a string")
+    if not isinstance(raw_result.get("mtime"), (int, float)):
+        return Err("cache result field mtime must be numeric")
+    if not isinstance(raw_result.get("has_validation"), bool):
+        return Err("cache result field has_validation must be boolean")
+    list_fields = (
+        "imports",
+        "exports_abstract",
+        "implements",
+        "extends",
+        "entities",
+        "imported_names",
+        "exported_names",
+    )
+    for field_name in list_fields:
+        if not isinstance(raw_result.get(field_name), list):
+            return Err(f"cache result field {field_name} must be a list")
+
+    try:
+        return Ok(FileResult(**raw_result))
+    except TypeError as error:
+        return Err(f"cache result shape is invalid: {error}")
 
 
 def is_cache_entry_current(path: str, entry: object) -> bool:
@@ -1711,16 +1908,85 @@ def make_node_id(path: str, root: str) -> str:
 # Graph building
 # ---------------------------------------------------------------------------
 
-def build_graph(
-    results: list[FileResult], root: str,
-) -> tuple[list[dict], list[dict]]:
+def _build_node_indexes(
+    results: list[FileResult],
+    root: str,
+) -> Result[tuple[dict[str, str], dict[str, FileResult]], GraphBuildError]:
+    """Build collision-free module indexes before any graph facts are emitted."""
+    paths_by_id: dict[str, list[str]] = {}
+    for result in results:
+        node_id = make_node_id(result.path, root)
+        relative_path = os.path.relpath(result.path, root).replace(os.sep, "/")
+        paths_by_id.setdefault(node_id, []).append(relative_path)
+
+    collisions = tuple(
+        NodeIdCollision(node_id, tuple(sorted(paths)))
+        for node_id, paths in sorted(paths_by_id.items())
+        if len(paths) > 1
+    )
+    if collisions:
+        return Err(GraphBuildError(collisions))
+
     path_to_id: dict[str, str] = {}
     id_to_result: dict[str, FileResult] = {}
+    for result in sorted(results, key=lambda item: make_node_id(item.path, root)):
+        node_id = make_node_id(result.path, root)
+        path_to_id[result.path] = node_id
+        id_to_result[node_id] = result
+    return Ok((path_to_id, id_to_result))
 
-    for r in results:
-        node_id = make_node_id(r.path, root)
-        path_to_id[r.path] = node_id
-        id_to_result[node_id] = r
+
+def _imported_name_parts(raw: object) -> Optional[tuple[str, str]]:
+    """Read the local name and module from a validated import descriptor."""
+    if not isinstance(raw, dict):
+        return None
+    local_name = raw.get("local")
+    module = raw.get("module")
+    if not isinstance(local_name, str) or not isinstance(module, str):
+        return None
+    return local_name, module
+
+
+def _resolve_provider(
+    symbol: str,
+    source: FileResult,
+    root: str,
+    path_to_id: dict[str, str],
+    provider_candidates: dict[str, set[str]],
+    ts_path_aliases: tuple[TsPathAliasContext, ...],
+    ts_packages: tuple[TsPackage, ...],
+) -> Optional[str]:
+    """Resolve a provider through an explicit import, otherwise fail closed."""
+    for imported_name in source.imported_names:
+        imported_parts = _imported_name_parts(imported_name)
+        if imported_parts is None:
+            continue
+        local_name, module = imported_parts
+        if local_name != symbol:
+            continue
+        return resolve_import(
+            module,
+            source.path,
+            root,
+            path_to_id,
+            source.language,
+            ts_path_aliases,
+            ts_packages,
+        )
+
+    candidates = provider_candidates.get(symbol, set())
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return None
+
+
+def build_graph(
+    results: list[FileResult], root: str,
+) -> Result[GraphBuildOutput, GraphBuildError]:
+    index_result = _build_node_indexes(results, root)
+    if isinstance(index_result, Err):
+        return index_result
+    path_to_id, id_to_result = index_result.value
 
     # Load tsconfig.json path aliases for resolving @sdk/*, @agent-*/* etc.
     ts_path_aliases = _load_ts_path_aliases(root)
@@ -1730,41 +1996,35 @@ def build_graph(
     if ts_packages:
         print(f"[belief-map] Loaded {len(ts_packages)} local TS packages", file=sys.stderr)
 
-    # Map: abstract/interface name -> defining node id
-    abstract_providers: dict[str, str] = {}
+    # Map every abstract/interface name to every provider. Resolution prefers
+    # the consumer's explicit import and otherwise accepts only one candidate.
+    provider_candidates: dict[str, set[str]] = {}
     for nid, r in id_to_result.items():
         for ab in r.exports_abstract:
-            abstract_providers[ab] = nid
+            provider_candidates.setdefault(ab, set()).add(nid)
 
-    # Also register ALL interface-kind entities regardless of whether they are in
-    # exports_abstract (which only captures explicit exports). Non-exported interfaces
-    # used locally and interfaces from imported modules are resolved by bare name at
-    # the CALLS_API detection step, so they must be present in this map.
     for nid, r in id_to_result.items():
         for ent in r.entities:
-            ent_kind = ent.get("kind", "") if isinstance(ent, dict) else getattr(ent, "kind", "")
-            ent_name = ent.get("name", "") if isinstance(ent, dict) else getattr(ent, "name", "")
-            if ent_kind == "interface" and ent_name and ent_name not in abstract_providers:
-                abstract_providers[ent_name] = nid
+            if not isinstance(ent, dict):
+                continue
+            ent_kind = ent.get("kind")
+            ent_name = ent.get("name")
+            if ent_kind == "interface" and isinstance(ent_name, str) and ent_name:
+                provider_candidates.setdefault(ent_name, set()).add(nid)
 
-    # Map: (node_id, entity_name) -> True  (for cross-file entity lookups)
-    entity_index: dict[str, str] = {}  # "EntityName" -> "node_id"
+    entity_candidates: dict[str, set[str]] = {}
     for nid, r in id_to_result.items():
         for name in r.exported_names:
-            # First definition wins (avoids overwrites from re-exports)
-            if name not in entity_index:
-                entity_index[name] = nid
+            entity_candidates.setdefault(name, set()).add(nid)
 
-    # Register any entity that is used as a base class by other classes.
-    # This catches BaseModel, CanActivate, BaseProcessor, BaseAgent, etc.
-    # that are defined in the codebase but not marked as abstract/interface.
     all_bases: set[str] = set()
-    for r in results:
+    for r in id_to_result.values():
         for base in r.implements + r.extends:
             all_bases.add(base)
     for base_name in all_bases:
-        if base_name not in abstract_providers and base_name in entity_index:
-            abstract_providers[base_name] = entity_index[base_name]
+        provider_candidates.setdefault(base_name, set()).update(
+            entity_candidates.get(base_name, set())
+        )
 
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -1840,7 +2100,15 @@ def build_graph(
         # Source 1: FileResult.implements + extends (from heritage clauses)
         calls_api_targets: set[str] = set()
         for iface in r.implements + r.extends:
-            provider_id = abstract_providers.get(iface)
+            provider_id = _resolve_provider(
+                iface,
+                r,
+                root,
+                path_to_id,
+                provider_candidates,
+                ts_path_aliases,
+                ts_packages,
+            )
             if provider_id and provider_id != node_id:
                 calls_api_targets.add(provider_id)
 
@@ -1848,7 +2116,15 @@ def build_graph(
         # heritage clauses, and bases defined in other modules)
         for ent in r.entities:
             for base_name in ent.get("bases", []):
-                provider_id = abstract_providers.get(base_name)
+                provider_id = _resolve_provider(
+                    base_name,
+                    r,
+                    root,
+                    path_to_id,
+                    provider_candidates,
+                    ts_path_aliases,
+                    ts_packages,
+                )
                 if provider_id and provider_id != node_id:
                     calls_api_targets.add(provider_id)
 
@@ -1865,7 +2141,15 @@ def build_graph(
 
         # -- DATA_FLOWS_TO edges --
         for imp in r.imports:
-            target_id = resolve_import(imp, r.path, root, path_to_id, r.language, ts_path_aliases)
+            target_id = resolve_import(
+                imp,
+                r.path,
+                root,
+                path_to_id,
+                r.language,
+                ts_path_aliases,
+                ts_packages,
+            )
             if target_id and target_id != node_id:
                 target_r = id_to_result.get(target_id)
                 if target_r and target_r.has_validation:
@@ -1883,7 +2167,13 @@ def build_graph(
         # For each imported name, link source_entity -> target_entity
         for imp_name in r.imported_names:
             target_id = resolve_import(
-                imp_name["module"], r.path, root, path_to_id, r.language, ts_path_aliases,
+                imp_name["module"],
+                r.path,
+                root,
+                path_to_id,
+                r.language,
+                ts_path_aliases,
+                ts_packages,
             )
             if not target_id or target_id == node_id:
                 continue
@@ -2011,7 +2301,7 @@ def build_graph(
                 "detail": "UI imports infrastructure without abstract base",
             })
 
-    return nodes, edges
+    return Ok(GraphBuildOutput(nodes, edges))
 
 
 def _find_local_references(entities: list[dict], name: str) -> list[str]:
@@ -3162,14 +3452,18 @@ def _build_path_tree(path_sid_pairs: list[tuple[str, str]]) -> list[str]:
     return emit(compressed, 1)
 
 
-def write_sexp(
-    output_path: str,
+def _is_safe_path_atom(path: str) -> bool:
+    """Return whether every path segment is safe in the unquoted trie syntax."""
+    return bool(re.fullmatch(r"[A-Za-z0-9_./@+-]+", path))
+
+
+def render_sexp(
     nodes: list[dict],
     edges: list[dict],
     _root: str,
     mode: str,
     total_files: int,
-) -> None:
+) -> str:
     """
     Write the belief map as flat S-expression facts with path-map compression.
 
@@ -3244,11 +3538,26 @@ def write_sexp(
     lines.append("; Belief Map")
     lines.append(f"; mode {mode}")
     lines.append(f"; {total_files} files {len(sorted_nodes)} nodes {len(real_edges)} edges {len(violations)} violations")
+    lines.append(
+        f"(belief-map :schema {MAP_SCHEMA_VERSION} :files {total_files} "
+        f":nodes {len(sorted_nodes)} :edges {len(real_edges)} "
+        f":violations {len(violations)})"
+    )
     lines.append("")
 
     # -- Path tree (compressed trie) --
     lines.append("; --- paths ---")
-    trie_pairs = [(node["id"], path_to_sid[node["id"]]) for node in sorted_nodes]
+    safe_nodes = [
+        node for node in sorted_nodes if _is_safe_path_atom(node["id"])
+    ]
+    unsafe_nodes = [
+        node for node in sorted_nodes if not _is_safe_path_atom(node["id"])
+    ]
+    for node in unsafe_nodes:
+        sid = path_to_sid[node["id"]]
+        escaped_path = _sexp_escape(node["id"])
+        lines.append(f'(def {sid} "{escaped_path}")')
+    trie_pairs = [(node["id"], path_to_sid[node["id"]]) for node in safe_nodes]
     lines.append("(paths")
     lines.extend(_build_path_tree(trie_pairs))
     lines.append(")")
@@ -3339,45 +3648,140 @@ def write_sexp(
             detail = _sexp_escape(v.get("detail", ""))
             lines.append(f'(violation {rule} {src} {tgt} "{detail}")')
 
-    with open(output_path, "w") as f:
-        f.write("\n".join(lines))
-        f.write("\n")
+    return "\n".join(lines) + "\n"
+
+
+def write_sexp(
+    output_path: str,
+    nodes: list[dict],
+    edges: list[dict],
+    root: str,
+    mode: str,
+    total_files: int,
+) -> None:
+    """Atomically publish a fully rendered belief map."""
+    content = render_sexp(nodes, edges, root, mode, total_files)
+    _atomic_write_text(output_path, content)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    args = sys.argv[1:]
-    full_rebuild = "--full" in args
-    use_lsp = "--lsp" in args
+@dataclass(frozen=True)
+class BuilderOptions:
+    root: str
+    output_path: str
+    full_rebuild: bool
+    use_lsp: bool
+    lsp_timeout: float
+
+
+def _builder_usage() -> str:
+    return (
+        "usage: build_belief_map.py --root ABSOLUTE_PATH "
+        "[--output ABSOLUTE_PATH] [--full] [--lsp] "
+        "[--lsp-timeout SECONDS]"
+    )
+
+
+def parse_builder_options(args: list[str]) -> Result[BuilderOptions, str]:
+    """Validate builder CLI inputs before filesystem work starts."""
+    root_argument: Optional[str] = None
+    output_argument: Optional[str] = None
+    full_rebuild = False
+    use_lsp = False
     lsp_timeout = LSP_REQUEST_TIMEOUT
 
-    # Parse --lsp-timeout N
-    known_flags = {"--full", "--lsp"}
-    clean_args = []
-    i = 0
-    while i < len(args):
-        if args[i] == "--lsp-timeout" and i + 1 < len(args):
-            try:
-                lsp_timeout = float(args[i + 1])
-            except ValueError:
-                print(f"Error: invalid --lsp-timeout value: {args[i + 1]}", file=sys.stderr)
-                sys.exit(1)
-            i += 2
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument in ("--root", "--output", "--lsp-timeout"):
+            if index + 1 >= len(args):
+                return Err(f"{argument} requires a value")
+            value = args[index + 1]
+            if argument == "--root":
+                root_argument = value
+            elif argument == "--output":
+                output_argument = value
+            else:
+                try:
+                    lsp_timeout = float(value)
+                except ValueError:
+                    return Err(f"invalid --lsp-timeout value: {value}")
+            index += 2
             continue
-        if args[i] not in known_flags:
-            clean_args.append(args[i])
-        i += 1
+        if argument == "--full":
+            full_rebuild = True
+            index += 1
+            continue
+        if argument == "--lsp":
+            use_lsp = True
+            index += 1
+            continue
+        return Err(f"unknown argument: {argument}")
 
-    root = os.path.realpath(clean_args[0] if clean_args else ".")
+    if root_argument is None:
+        return Err("--root is required")
+    if not os.path.isabs(root_argument):
+        return Err("--root must be an absolute path")
+    root = os.path.realpath(root_argument)
     if not os.path.isdir(root):
-        print(f"Error: {root} is not a directory", file=sys.stderr)
-        sys.exit(1)
+        return Err(f"{root} is not a directory")
 
+    if not math.isfinite(lsp_timeout) or lsp_timeout <= 0:
+        return Err("--lsp-timeout must be a positive finite number")
+
+    output_path = output_argument or os.path.join(root, OUTPUT_FILE)
+    if not os.path.isabs(output_path):
+        return Err("--output must be an absolute path")
+    output_path = os.path.realpath(output_path)
+    output_directory = os.path.dirname(output_path)
+    if not os.path.isdir(output_directory):
+        return Err(f"output directory does not exist: {output_directory}")
+
+    return Ok(BuilderOptions(
+        root=root,
+        output_path=output_path,
+        full_rebuild=full_rebuild,
+        use_lsp=use_lsp,
+        lsp_timeout=lsp_timeout,
+    ))
+
+
+def _cache_entry_result(path: str, entry: object) -> Result[FileResult, str]:
+    if not is_cache_entry_current(path, entry):
+        return Err("content hash changed or cache entry is invalid")
+    return decode_cache_entry(entry)
+
+
+def _serialize_file_result(result: FileResult) -> dict:
+    return {
+        "mtime": result.mtime,
+        "result": {
+            "path": result.path,
+            "language": result.language,
+            "repo": result.repo,
+            "mtime": result.mtime,
+            "content_hash": result.content_hash,
+            "imports": result.imports,
+            "exports_abstract": result.exports_abstract,
+            "implements": result.implements,
+            "extends": result.extends,
+            "purpose": result.purpose,
+            "naming_convention": result.naming_convention,
+            "has_validation": result.has_validation,
+            "entities": result.entities,
+            "imported_names": result.imported_names,
+            "exported_names": result.exported_names,
+        },
+    }
+
+
+def _run_build(options: BuilderOptions) -> int:
+    root = options.root
     t0 = time.monotonic()
-    mode = "LSP-enhanced" if use_lsp else "regex/AST"
+    mode = "LSP-enhanced" if options.use_lsp else "regex/AST"
     print(f"[belief-map] Scanning {root} ... (mode: {mode})")
 
     files = discover_files(root)
@@ -3386,15 +3790,22 @@ def main():
     print(f"[belief-map] Found {len(files)} source files ({py_count} py, {ts_count} ts)")
     print("[belief-map] Supported source: .py, .ts, .tsx; other languages are excluded")
 
-    cache = {} if full_rebuild else load_cache(root)
+    cache = {} if options.full_rebuild else load_cache(root)
     to_parse: list[tuple[str, str, str]] = []
     cached_results: list[FileResult] = []
 
     for path, lang, repo in files:
         entry = cache.get(path)
-        if entry and not full_rebuild and is_cache_entry_current(path, entry):
-            cached_results.append(FileResult(**entry["result"]))
-            continue
+        if entry and not options.full_rebuild:
+            cached_result = _cache_entry_result(path, entry)
+            if isinstance(cached_result, Ok):
+                cached_results.append(cached_result.value)
+                continue
+            print(
+                f"[belief-map] WARNING: rebuilding invalid cache entry for "
+                f"{path}: {cached_result.error}",
+                file=sys.stderr,
+            )
         to_parse.append((path, lang, repo))
 
     print(f"[belief-map] Parsing {len(to_parse)} changed files ({len(cached_results)} cached)")
@@ -3409,53 +3820,58 @@ def main():
                 if result:
                     new_results.append(result)
 
-    # Update cache
-    new_cache: dict = {}
-    all_results = cached_results + new_results
-    for r in all_results:
-        new_cache[r.path] = {
-            "mtime": r.mtime,
-            "result": {
-                "path": r.path,
-                "language": r.language,
-                "repo": r.repo,
-                "mtime": r.mtime,
-                "content_hash": r.content_hash,
-                "imports": r.imports,
-                "exports_abstract": r.exports_abstract,
-                "implements": r.implements,
-                "extends": r.extends,
-                "purpose": r.purpose,
-                "naming_convention": r.naming_convention,
-                "has_validation": r.has_validation,
-                "entities": r.entities,
-                "imported_names": r.imported_names,
-                "exported_names": r.exported_names,
-            },
-        }
-    save_cache(root, new_cache)
-
-    # Build graph (regex/AST pass)
-    nodes, edges = build_graph(all_results, root)
+    all_results = sorted(
+        cached_results + new_results,
+        key=lambda result: os.path.relpath(result.path, root).replace(os.sep, "/"),
+    )
+    graph_result = build_graph(all_results, root)
+    if isinstance(graph_result, Err):
+        for collision in graph_result.error.collisions:
+            paths = ", ".join(collision.paths)
+            print(
+                f"[belief-map] ERROR: module ID collision "
+                f"{collision.node_id}: {paths}",
+                file=sys.stderr,
+            )
+        print(
+            "[belief-map] ERROR: no cache or map was published",
+            file=sys.stderr,
+        )
+        return 1
+    nodes = graph_result.value.nodes
+    edges = graph_result.value.edges
 
     t_regex = time.monotonic() - t0
     print(f"[belief-map] Regex/AST pass: {t_regex:.2f}s -- {len(nodes)} nodes, {len(edges)} edges")
 
     # LSP enrichment pass (if requested)
-    if use_lsp:
+    if options.use_lsp:
         t_lsp_start = time.monotonic()
-        print(f"[belief-map] Starting LSP enrichment (timeout={lsp_timeout}s per request) ...")
-        nodes, edges = enrich_with_lsp(root, all_results, nodes, edges, lsp_timeout)
+        print(
+            f"[belief-map] Starting LSP enrichment "
+            f"(timeout={options.lsp_timeout}s per request) ..."
+        )
+        nodes, edges = enrich_with_lsp(
+            root,
+            all_results,
+            nodes,
+            edges,
+            options.lsp_timeout,
+        )
         t_lsp = time.monotonic() - t_lsp_start
         print(f"[belief-map] LSP pass: {t_lsp:.2f}s")
 
-    # Write output
-    output_path = os.path.join(root, OUTPUT_FILE)
-    write_sexp(output_path, nodes, edges, root, mode, len(all_results))
+    new_cache = {
+        result.path: _serialize_file_result(result)
+        for result in all_results
+    }
+    map_content = render_sexp(nodes, edges, root, mode, len(all_results))
+    save_cache(root, new_cache)
+    _atomic_write_text(options.output_path, map_content)
 
     elapsed = time.monotonic() - t0
     print(f"[belief-map] Done in {elapsed:.2f}s -- {len(nodes)} nodes, {len(edges)} edges")
-    print(f"[belief-map] Output: {output_path}")
+    print(f"[belief-map] Output: {options.output_path}")
 
     # Stats
     repos = sorted(set(n["repo"] for n in nodes))
@@ -3470,7 +3886,62 @@ def main():
         print(f"[belief-map]   {etype}: {count}")
     if lsp_verified:
         print(f"[belief-map]   LSP-verified: {lsp_verified}")
+    return 0
+
+
+def _lock_path(root: str) -> str:
+    root_digest = hashlib.sha256(root.encode("utf-8")).hexdigest()[:20]
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"codespaces-belief-map-{root_digest}.lock",
+    )
+
+
+def main(args: Optional[list[str]] = None) -> int:
+    raw_args = list(sys.argv[1:] if args is None else args)
+    if raw_args in (["-h"], ["--help"]):
+        print(_builder_usage())
+        return 0
+    parsed_options = parse_builder_options(raw_args)
+    if isinstance(parsed_options, Err):
+        print(f"Error: {parsed_options.error}", file=sys.stderr)
+        print(_builder_usage(), file=sys.stderr)
+        return 2
+
+    options = parsed_options.value
+    lock_path = _lock_path(options.root)
+    try:
+        lock_file = open(lock_path, "a+", encoding="utf-8")
+    except OSError as error:
+        print(
+            f"[belief-map] ERROR: could not open build lock {lock_path}: {error}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(
+                f"[belief-map] ERROR: another build is active for {options.root}",
+                file=sys.stderr,
+            )
+            return 1
+        return _run_build(options)
+    except OSError as error:
+        print(f"[belief-map] ERROR: build failed: {error}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError as error:
+            print(
+                f"[belief-map] ERROR: could not release build lock: {error}",
+                file=sys.stderr,
+            )
+        lock_file.close()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

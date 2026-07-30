@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -25,6 +26,7 @@ class BeliefSearchAliasTest(unittest.TestCase):
         sexp_path.write_text(
             textwrap.dedent(
                 """
+                (belief-map :schema 1 :files 2 :nodes 2 :edges 1 :violations 0)
                 (paths
                   (app-service
                     (app-service
@@ -48,7 +50,8 @@ class BeliefSearchAliasTest(unittest.TestCase):
         )
 
         graph = belief_search.BeliefGraph()
-        graph.load(str(sexp_path))
+        load_result = graph.load(str(sexp_path))
+        self.assertIsInstance(load_result, belief_search.MapLoadOk)
         return graph, str(sexp_path)
 
     def test_resolve_module_accepts_path_aliases(self) -> None:
@@ -146,6 +149,52 @@ class BeliefSearchAliasTest(unittest.TestCase):
         text = output.getvalue()
         self.assertIn("(error no-match workspace-operative.controller :suggestions", text)
         self.assertIn("workspace-operative.service", text)
+
+    def test_malformed_and_adversarial_patterns_fail_without_traceback(self) -> None:
+        """/* REQ-CS-030: unsafe search patterns must fail quickly and clearly. */"""
+        _graph, sexp_path = self._load_graph()
+
+        for pattern in ("[", "(a+)+$"):
+            with self.subTest(pattern=pattern):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(SCRIPT_PATH),
+                        "--map",
+                        sexp_path,
+                        "search",
+                        pattern,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("(error invalid-argument", result.stdout)
+                self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_invalid_depth_fails_without_loading_or_traceback(self) -> None:
+        """/* REQ-CS-031: invalid numeric query arguments must return typed diagnostics. */"""
+        _graph, sexp_path = self._load_graph()
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "--map",
+                sexp_path,
+                "deps",
+                "workspace-operative.service",
+                "unbounded",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("depth must be an integer", result.stdout)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

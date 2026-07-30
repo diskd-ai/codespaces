@@ -52,7 +52,9 @@ class AuditRegressionTest(unittest.TestCase):
         return result
 
     def _import_edges(self, results: list[object], root: Path) -> set[tuple[str, str]]:
-        _nodes, edges = build_belief_map.build_graph(results, str(root))
+        graph_result = build_belief_map.build_graph(results, str(root))
+        self.assertIsInstance(graph_result, build_belief_map.Ok)
+        edges = graph_result.value.edges
         return {
             (edge["source"], edge["target"])
             for edge in edges
@@ -83,7 +85,13 @@ class AuditRegressionTest(unittest.TestCase):
             (package / "after.py").write_text("VALUE = 'after'\n", encoding="utf-8")
 
             subprocess.run(
-                [sys.executable, str(BUILD_SCRIPT), "--full", str(root)],
+                [
+                    sys.executable,
+                    str(BUILD_SCRIPT),
+                    "--root",
+                    str(root),
+                    "--full",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -96,13 +104,14 @@ class AuditRegressionTest(unittest.TestCase):
             )
 
             result = subprocess.run(
-                [sys.executable, str(BUILD_SCRIPT), str(root)],
+                [sys.executable, str(BUILD_SCRIPT), "--root", str(root)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             graph = belief_search.BeliefGraph()
-            graph.load(str(root / ".belief_map.sexp"))
+            load_result = graph.load(str(root / ".belief_map.sexp"))
+            self.assertIsInstance(load_result, belief_search.MapLoadOk)
 
         targets = {edge.target for edge in graph.edges_from["pkg/source"]}
         self.assertIn("Parsing 1 changed files", result.stdout)
@@ -137,10 +146,12 @@ class AuditRegressionTest(unittest.TestCase):
             )
             self.assertIsNotNone(source_result)
             self.assertIsNotNone(shared_result)
-            _nodes, edges = build_belief_map.build_graph(
+            graph_result = build_belief_map.build_graph(
                 [source_result, shared_result],
                 str(root),
             )
+            self.assertIsInstance(graph_result, build_belief_map.Ok)
+            edges = graph_result.value.edges
 
         import_edges = {
             (edge["source"], edge["target"])
@@ -169,10 +180,12 @@ class AuditRegressionTest(unittest.TestCase):
             )
             self.assertIsNotNone(source_result)
             self.assertIsNotNone(target_result)
-            _nodes, edges = build_belief_map.build_graph(
+            graph_result = build_belief_map.build_graph(
                 [source_result, target_result],
                 str(root),
             )
+            self.assertIsInstance(graph_result, build_belief_map.Ok)
+            edges = graph_result.value.edges
 
         import_edges = {
             (edge["source"], edge["target"])
@@ -356,10 +369,15 @@ class AuditRegressionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             map_path = root / ".belief_map.sexp"
-            map_path.write_text("(paths\n)\n", encoding="utf-8")
+            map_path.write_text(
+                "(belief-map :schema 1 :files 0 :nodes 0 :edges 0 "
+                ":violations 0)\n(paths\n)\n",
+                encoding="utf-8",
+            )
             graph = belief_search.BeliefGraph()
 
-            graph.load(str(map_path))
+            load_result = graph.load(str(map_path))
+            self.assertIsInstance(load_result, belief_search.MapLoadOk)
 
         self.assertEqual(graph._root, str(root))
 
