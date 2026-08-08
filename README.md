@@ -5,10 +5,10 @@
 > **Release notes:** [Changelog](CHANGELOG.md)
 
 Understand a large codebase before you change it. Codespaces is an
-architecture-aware code search tool for Python, TypeScript, TSX, and Rust
-repositories. It helps developers and AI coding agents find the right module,
-trace dependencies, measure change impact, and read only the source files that
-matter.
+architecture-aware code search tool for Python, TypeScript, TSX, Rust, C#,
+Java, and Go repositories. It helps developers and AI coding agents find the
+right module, trace dependencies, measure change impact, and read only the
+source files that matter.
 
 Use it for codebase architecture discovery, dependency graph search, blast-radius
 analysis, call-flow tracing, monorepo navigation, and safer AI-assisted coding.
@@ -103,10 +103,14 @@ is outside the current directory.
 | Python | Modules, imports, classes, functions, methods, inheritance, and references |
 | TypeScript and TSX | Imports, re-exports, classes, interfaces, functions, types, decorators, aliases, and references |
 | Rust | Cargo crates, modules, `use` dependencies, structs, traits, enums, functions, implementations, and methods |
+| C# | Namespaces, types, interfaces, records, enums, methods, attributes, inheritance, and local type dependencies |
+| Java | Packages, imports, classes, interfaces, records, enums, methods, annotations, inheritance, and local type dependencies |
+| Go | Modules, packages, imports, structs, interfaces, functions, constants, variables, receiver methods, and local package dependencies |
 
 Codespaces is designed for single repositories and monorepos. It understands
 Python project roots, TypeScript configuration and package aliases, Cargo package
-names, and local Rust crate dependencies.
+names and local Rust crate dependencies, .NET solutions and projects, Maven and
+Gradle projects, and Go modules and workspaces.
 
 It can also map infrastructure relationships from Kustomize, Helm, and Terraform.
 

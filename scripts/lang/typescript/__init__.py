@@ -29,6 +29,9 @@ class TypeScriptLanguage:
             and not file_name.endswith(".d.ts")
         )
 
+    def accepts_project_config(self, file_name: str) -> bool:
+        return file_name in self.project_config_names
+
     def parse(
         self,
         path: str,

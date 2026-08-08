@@ -2,7 +2,8 @@
 name: codespaces
 description: >
   Build and query architecture-aware code search, dependency graphs, call flows,
-  impact analysis, and belief maps for Python, TypeScript, TSX, and Rust repositories.
+  impact analysis, and belief maps for Python, TypeScript, TSX, Rust, C#, Java,
+  and Go repositories.
   Use before non-trivial code changes to find module boundaries, blast radius,
   architecture violations, and the minimal source files to read.
 ---
@@ -138,7 +139,9 @@ Key patterns:
 (result-count 42)
 ```
 
-**`:lang` values**: `py` = Python (snake_case), `ts` = TypeScript (camelCase), `tsx` = TSX (PascalCase), `rs` = Rust (snake_case).
+**`:lang` values**: `py` = Python (snake_case), `ts` = TypeScript
+(camelCase), `tsx` = TSX (PascalCase), `rs` = Rust (snake_case), `cs` = C#,
+`java` = Java, and `go` = Go.
 
 ## Scheme Query Language
 
@@ -246,6 +249,12 @@ The TypeScript AST contract covers TS/TSX imports and re-exports, literal
 self-imports. It does not promise inherited `tsconfig` aliases,
 `baseUrl`-only resolution, package `source`/`exports`, or self-package export
 subpaths.
+
+C# indexing follows namespaces and referenced local types; Java indexing
+follows packages, explicit imports, and referenced wildcard types. Unused
+namespace or wildcard imports do not create guessed edges. Go indexing resolves
+local module imports to the source files that make up the imported package.
+Standard .NET `bin`/`obj` output and Go `vendor` dependencies are excluded.
 
 ## Infrastructure Topology
 

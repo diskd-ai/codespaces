@@ -4,6 +4,9 @@
 
 ### Changes
 
+- Added official Tree-sitter support for C#, Java, and Go source discovery,
+  entity extraction, local dependency resolution, project recognition, and LSP
+  metadata.
 - Added a language-neutral adapter contract so source discovery, parsing,
   module identity, dependency resolution, output, and LSP metadata can be
   extended without adding language branches to graph orchestration.
@@ -17,6 +20,10 @@
 
 ### Fixes
 
+- Excluded standard .NET `bin`/`obj` outputs and Go `vendor` dependencies from
+  source discovery.
+- Prevented unused C# namespace and Java wildcard imports from creating guessed
+  dependency edges based only on package cardinality.
 - Rust files, local Cargo modules, workspace crate dependencies, and imported
   Rust entity references are now represented in generated architecture maps.
 

@@ -11,6 +11,9 @@
 - Added a Rust adapter under `scripts/lang/rust` with Tree-sitter entity
   extraction, trait and inherent implementation methods, Cargo workspace
   resolution, and rust-analyzer metadata.
+- Added official Tree-sitter adapters for C#, Java, and Go with language-owned
+  parsing, project recognition, module identity, local import resolution, and
+  language-server metadata.
 - Added focused registry, script-mode CLI, Rust parser, and Cargo dependency
   tests while retaining the hardened builder and TypeScript recall coverage.
 - Rewrote the README and public descriptions around user questions, quick code
@@ -28,11 +31,22 @@
 - Verified Rust support against `diskd-cli`: all 4 tracked Rust files were
   discovered, all 256 source-oracle entities matched, and both local crate
   dependency edges matched, with 100% precision and recall.
+- Verified C# on `avsync-api-core`: 254/254 authored files, 286/286 entities,
+  and 728/728 source-derived local import edges matched with no parse errors.
+- Verified Java on `nextnet-tangerine-service`: 28/28 files, 28/28 entities,
+  and 46/46 source-derived local import edges matched with no parse errors.
+- Verified Go on the Avionica `go-gobwas` target: 1/1 file and 14/14 entities
+  matched with no parse errors; its source has no local package-import recall
+  denominator, so a focused multi-package fixture verified both expected local
+  package edges instead.
+- Excluded .NET build output and Go vendored dependencies, and required an
+  actual type reference before resolving C# namespaces or Java wildcards.
 
 ### Motivation
 - Make new source-language support additive at one explicit boundary, prove
-  Rust coverage on a real Cargo workspace, and make the project easier to find
-  and use without weakening existing graph correctness guarantees.
+  Rust, C#, Java, and Go coverage on real source repositories, and make the
+  project easier to find and use without weakening existing graph correctness
+  guarantees.
 
 ## 2026-07-30
 

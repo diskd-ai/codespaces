@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from .csharp import CSHARP_LANGUAGE
+from .go import GO_LANGUAGE
 from .interface import BoundLanguage, Entity, FileResult, ImportedName, Language
+from .java import JAVA_LANGUAGE
 from .python import PYTHON_LANGUAGE
 from .rust import RUST_LANGUAGE
 from .typescript import TYPESCRIPT_LANGUAGE
@@ -14,6 +17,9 @@ LANGUAGES: tuple[Language, ...] = (
     PYTHON_LANGUAGE,
     TYPESCRIPT_LANGUAGE,
     RUST_LANGUAGE,
+    CSHARP_LANGUAGE,
+    JAVA_LANGUAGE,
+    GO_LANGUAGE,
 )
 
 

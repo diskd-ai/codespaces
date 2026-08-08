@@ -129,6 +129,10 @@ class Language(Protocol):
         """Return whether this implementation owns the source file."""
         ...
 
+    def accepts_project_config(self, file_name: str) -> bool:
+        """Return whether a project config belongs to this language."""
+        ...
+
     def parse(
         self,
         path: str,

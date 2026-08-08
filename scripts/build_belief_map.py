@@ -16,17 +16,24 @@ Parsers
 - **Python**: stdlib ``ast``. Full class/function/import extraction.
 - **Rust**: tree-sitter (``tree-sitter-rust``). Handles Cargo crates,
   declarations, implementations, methods, and ``use``/``mod`` dependencies.
+- **C#**: tree-sitter (``tree-sitter-c-sharp``). Handles namespaces, types,
+  methods, attributes, inheritance, and local type dependencies.
+- **Java**: tree-sitter (``tree-sitter-java``). Handles packages, types,
+  methods, annotations, inheritance, and local type dependencies.
+- **Go**: tree-sitter (``tree-sitter-go``). Handles modules, packages, types,
+  functions, receiver methods, and local package dependencies.
 
 Modes
 -----
 **Default** (fast, ~5-8s for full workspace):
-    Parses all .py/.ts/.tsx/.rs files, builds import/reference/data-flow edges.
+    Parses all .py/.ts/.tsx/.rs/.cs/.java/.go files and builds
+    import/reference/data-flow edges.
 
 **LSP-enhanced** (``--lsp``, ~1-5min):
     After default pass, starts ``typescript-language-server`` and
-    ``pyright-langserver`` or ``rust-analyzer`` per project to query call
-    hierarchy and references. Adds precise ``calls`` edges and ``:lsp``
-    annotations.
+    ``pyright-langserver``, ``rust-analyzer``, ``csharp-ls``, ``jdtls``, or
+    ``gopls`` per project to query call hierarchy and references. Adds precise
+    ``calls`` edges and ``:lsp`` annotations.
 
 Edge Types
 ----------
@@ -55,7 +62,7 @@ Requirements
     python3 -m pip install -r requirements.txt
 
 Optional for ``--lsp``: ``typescript-language-server``, ``pyright-langserver``,
-``rust-analyzer``.
+``rust-analyzer``, ``csharp-ls``, ``jdtls``, or ``gopls``.
 
 Usage
 -----
@@ -130,8 +137,8 @@ except ModuleNotFoundError as dependency_error:
 
 SKIP_DIRS = {
     "node_modules", ".venv", "venv", "__pycache__", ".git", "dist",
-    ".next", ".turbo", "build", "coverage", ".tox", "site-packages",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache", "target",
+    ".next", ".turbo", "bin", "build", "obj", "coverage", ".tox", "site-packages",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "target", "vendor",
     ".worktrees", ".ralphy-worktrees", ".ralphy-sandboxes",
 }
 
@@ -1164,22 +1171,16 @@ def discover_projects(root: str, file_results: list[FileResult]) -> list[Project
     configs_by_language: dict[str, list[str]] = {
         language.name: [] for language in LANGUAGES
     }
-    config_owners = {
-        config_name: language.name
-        for language in LANGUAGES
-        for config_name in language.project_config_names
-    }
-
     for directory_path, directory_names, file_names in os.walk(root):
         directory_names[:] = [
             name for name in directory_names if name not in SKIP_DIRS
         ]
         for file_name in file_names:
-            owner_name = config_owners.get(file_name)
-            if owner_name is not None:
-                configs_by_language[owner_name].append(
-                    os.path.join(directory_path, file_name)
-                )
+            for language in LANGUAGES:
+                if language.accepts_project_config(file_name):
+                    configs_by_language[language.name].append(
+                        os.path.join(directory_path, file_name)
+                    )
 
     projects: list[ProjectGroup] = []
     assigned_files: set[str] = set()

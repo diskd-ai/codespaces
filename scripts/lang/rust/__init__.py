@@ -26,6 +26,9 @@ class RustLanguage:
     def accepts_file(self, file_name: str) -> bool:
         return file_name.endswith(".rs")
 
+    def accepts_project_config(self, file_name: str) -> bool:
+        return file_name in self.project_config_names
+
     def parse(
         self,
         path: str,

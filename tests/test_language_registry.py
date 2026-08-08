@@ -11,6 +11,9 @@ from scripts.lang import (
     language_for_file,
     language_for_name,
 )
+from scripts.lang.csharp import CSHARP_LANGUAGE
+from scripts.lang.go import GO_LANGUAGE
+from scripts.lang.java import JAVA_LANGUAGE
 from scripts.lang.python import PYTHON_LANGUAGE
 from scripts.lang.rust import RUST_LANGUAGE
 from scripts.lang.typescript import TYPESCRIPT_LANGUAGE
@@ -23,6 +26,9 @@ class LanguageRegistryTests(unittest.TestCase):
         self.assertIs(TYPESCRIPT_LANGUAGE, language_for_file("service.ts"))
         self.assertIs(TYPESCRIPT_LANGUAGE, language_for_file("view.tsx"))
         self.assertIs(RUST_LANGUAGE, language_for_file("module.rs"))
+        self.assertIs(CSHARP_LANGUAGE, language_for_file("Controller.cs"))
+        self.assertIs(JAVA_LANGUAGE, language_for_file("Controller.java"))
+        self.assertIs(GO_LANGUAGE, language_for_file("main.go"))
         self.assertIsNone(language_for_file("generated.d.ts"))
 
     def test_language_implementations_parse_their_source_contracts(self) -> None:
@@ -62,7 +68,7 @@ class LanguageRegistryTests(unittest.TestCase):
     def test_unknown_language_names_are_explicit_errors(self) -> None:
         """/* REQ-LANG-003: Unsupported parser dispatch never degrades into a silent fallback. */"""
         with self.assertRaises(UnsupportedLanguageError):
-            language_for_name("go")
+            language_for_name("kotlin")
 
     def test_builder_cli_uses_language_implementations_in_script_mode(self) -> None:
         """/* REQ-LANG-004: Script-mode CLI composition loads and executes registered languages. */"""
@@ -79,6 +85,18 @@ class LanguageRegistryTests(unittest.TestCase):
             )
             (target / "rust_worker.rs").write_text(
                 "pub fn execute() -> bool { true }\n",
+                encoding="utf-8",
+            )
+            (target / "CSharpWorker.cs").write_text(
+                "public class CSharpWorker {}\n",
+                encoding="utf-8",
+            )
+            (target / "JavaWorker.java").write_text(
+                "public class JavaWorker {}\n",
+                encoding="utf-8",
+            )
+            (target / "go_worker.go").write_text(
+                "package worker\n\nfunc Execute() bool { return true }\n",
                 encoding="utf-8",
             )
 
@@ -98,7 +116,7 @@ class LanguageRegistryTests(unittest.TestCase):
 
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertIn(
-                "Found 3 source files (1 py, 1 ts, 1 rs)",
+                "Found 6 source files (1 py, 1 ts, 1 rs, 1 cs, 1 java, 1 go)",
                 completed.stdout,
             )
             self.assertTrue((target / ".belief_map.sexp").is_file())
