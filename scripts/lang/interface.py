@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Protocol, TypedDict
 
 
@@ -20,6 +20,16 @@ class ImportedNamePayload(TypedDict):
     local: str
     original: str
     module: str
+
+
+class SourceRelationPayloadRequired(TypedDict):
+    target: str
+    relation: str
+
+
+class SourceRelationPayload(SourceRelationPayloadRequired, total=False):
+    source_entity: str
+    target_entity: str
 
 
 @dataclass
@@ -81,6 +91,7 @@ class FileResult:
     entities: list[EntityPayload]
     imported_names: list[ImportedNamePayload]
     exported_names: list[str]
+    relations: list[SourceRelationPayload] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

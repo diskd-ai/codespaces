@@ -3,7 +3,7 @@ name: codespaces
 description: >
   Build and query architecture-aware code search, dependency graphs, call flows,
   impact analysis, and belief maps for Python, TypeScript, TSX, Rust, C#, Java,
-  and Go repositories.
+  Go, Ruby, and Ruby on Rails repositories.
   Use before non-trivial code changes to find module boundaries, blast radius,
   architecture violations, and the minimal source files to read.
 ---
@@ -43,6 +43,7 @@ has the wrong version and prints the exact per-language command to run, such as:
 ```bash
 python3 -m pip install -r "$SKILL_ROOT/requirements/typescript.txt"
 python3 -m pip install -r "$SKILL_ROOT/requirements/csharp.txt"
+python3 -m pip install -r "$SKILL_ROOT/requirements/ruby.txt"
 ```
 
 Install only the requirement files named by the builder, then rerun it.
@@ -99,7 +100,7 @@ python3 scripts/belief_search.py analyze <module-id>
 | `invariants [id\|all]` | Check naming convention violations | `invariants all` |
 | `layers` | Show all modules by layer | `layers` |
 | `find_function <name>` | Find function/method definitions | `find_function createOrder` |
-| `find_type <name>` | Find type/class/ifc/enum definitions | `find_type DriveDbCommitResponse` |
+| `find_type <name>` | Find type/class/module/interface/enum definitions | `find_type DriveDbCommitResponse` |
 | `find_callchain <src> <tgt> [depth]` | Trace call path between functions | `find_callchain createOrder processPayment` |
 | `find_callers <fn> [depth]` | Who calls this function | `find_callers handleRequest 3` |
 | `find_calls <fn> [depth]` | What does this function call | `find_calls createOrder 2` |
@@ -152,7 +153,7 @@ Key patterns:
 
 **`:lang` values**: `py` = Python (snake_case), `ts` = TypeScript
 (camelCase), `tsx` = TSX (PascalCase), `rs` = Rust (snake_case), `cs` = C#,
-`java` = Java, and `go` = Go.
+`java` = Java, `go` = Go, and `rb` = Ruby/Rails.
 
 ## Scheme Query Language
 
@@ -266,6 +267,14 @@ follows packages, explicit imports, and referenced wildcard types. Unused
 namespace or wildcard imports do not create guessed edges. Go indexing resolves
 local module imports to the source files that make up the imported package.
 Standard .NET `bin`/`obj` output and Go `vendor` dependencies are excluded.
+
+Ruby indexing discovers `.rb` and `.rake` files and resolves explicit requires,
+local constants, Rails application roots, statically configured autoload roots,
+project acronyms, concerns, associations, callbacks, jobs, mailers, and spec
+references. It never boots Rails. Reopened or otherwise ambiguous constants and
+polymorphic associations remain unlinked instead of producing guessed edges.
+Rails relation flags are preserved as `:association`, `:concern`, `:callback`,
+`:job`, `:mailer`, or `:spec` in the generated map.
 
 ## Infrastructure Topology
 

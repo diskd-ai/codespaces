@@ -324,12 +324,13 @@ def _print_no_match(g: BeliefGraph, pattern: str) -> None:
 
 _TS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
 _PY_EXTENSIONS = (".py",)
+_RUBY_EXTENSIONS = (".rb", ".rake")
 
 
 def _module_id_to_file(module_id: str, root: str) -> str:
     """Convert a module ID back to a file path relative to root."""
     base = os.path.join(root, module_id)
-    for ext in _TS_EXTENSIONS + _PY_EXTENSIONS:
+    for ext in _TS_EXTENSIONS + _PY_EXTENSIONS + _RUBY_EXTENSIONS:
         candidate = base + ext
         if os.path.isfile(candidate):
             return candidate
@@ -485,7 +486,7 @@ class BeliefGraph:
                         pkg = rest[i + 1]
                 self.nodes[nid] = Node(nid, lang, purpose, naming, pkg)
 
-            elif kind in ("fn", "cls", "ifc", "typ", "enm") and len(tokens) >= 4:
+            elif kind in ("fn", "cls", "mod", "ifc", "typ", "enm") and len(tokens) >= 4:
                 module = _resolve(tokens[1])
                 name = tokens[2]
                 line_num = int(tokens[3]) if tokens[3].isdigit() else 0
@@ -776,6 +777,7 @@ _PURPOSE_TO_LAYER: dict[str, str] = {
     # Service layer
     "service": "service",
     "application service": "service",
+    "mailer": "service",
     "event handler": "service",
     "handler": "service",
     "event listener": "service",
@@ -1122,7 +1124,12 @@ def cmd_analyze(g: BeliefGraph, module_id: str) -> None:
             referencers.add(src_mod)
 
     # Key entities cross-repo usage (indexed)
-    exported_types = [e for e in ents if e.kind in ("cls", "ifc", "typ") and not e.name.startswith("_")]
+    exported_types = [
+        entity
+        for entity in ents
+        if entity.kind in ("cls", "mod", "ifc", "typ")
+        and not entity.name.startswith("_")
+    ]
     key_entity_usage: list[tuple[EntityFact, int, set[str]]] = []
     for et in exported_types:
         edges_for_name = g.edges_by_entity_name.get(et.name, [])
@@ -1366,6 +1373,7 @@ def cmd_layers(g: BeliefGraph) -> None:
 # no strict rule and are always considered conforming.
 _NAMING_RULES: dict[str, set[str]] = {
     "py":  {"snake_case", "mixed", "kebab-case"},
+    "rb":  {"snake_case", "mixed"},
     "tsx": {"PascalCase", "camelCase", "kebab-case", "mixed"},
     "ts":  {"camelCase", "PascalCase", "kebab-case", "mixed", "snake_case"},
 }
@@ -1429,6 +1437,13 @@ def cmd_invariants(g: BeliefGraph, scope: str) -> None:
 # Function / type search and call graph commands
 # ---------------------------------------------------------------------------
 
+def _short_function_name(entity_name: str) -> str:
+    separator_index = max(entity_name.rfind("#"), entity_name.rfind("."))
+    if separator_index < 0:
+        return entity_name
+    return entity_name[separator_index + 1 :]
+
+
 def cmd_find_function(g: BeliefGraph, name: str) -> None:
     """Find function/method definitions matching a name pattern.
 
@@ -1439,21 +1454,28 @@ def cmd_find_function(g: BeliefGraph, name: str) -> None:
         _print_invalid_pattern(name, parsed_pattern.error)
         return
     results: list[tuple[EntityFact, str]] = []
+    precise_methods: set[tuple[str, str]] = set()
 
     for ent_name, ent_list in g.entity_by_name.items():
         for ent in ent_list:
             if ent.kind == "fn":
+                short_name = _short_function_name(ent_name)
+                precise_methods.add((ent.module, short_name))
                 if (
                     ent_name == name
+                    or short_name == name
                     or search_pattern_matches(parsed_pattern.value, ent_name)
+                    or search_pattern_matches(parsed_pattern.value, short_name)
                 ):
                     results.append((ent, ""))
 
     # Also search methods inside classes
     for _mod, ent_list in g.entities.items():
         for ent in ent_list:
-            if ent.kind == "cls" and ent.methods:
+            if ent.kind in ("cls", "mod") and ent.methods:
                 for method in ent.methods:
+                    if (ent.module, method) in precise_methods:
+                        continue
                     if (
                         method == name
                         or search_pattern_matches(parsed_pattern.value, method)
@@ -1477,13 +1499,18 @@ def cmd_find_function(g: BeliefGraph, name: str) -> None:
             key = f"{ent.module}::{ent.name}"
             if key not in seen:
                 seen.add(key)
-                print(f"(fn-def {ent.module}::{ent.name} :line {ent.line} :lang {lang} :file {_q(fpath)} :kind function)")
+                function_kind = (
+                    "method"
+                    if _short_function_name(ent.name) != ent.name
+                    else "function"
+                )
+                print(f"(fn-def {ent.module}::{ent.name} :line {ent.line} :lang {lang} :file {_q(fpath)} :kind {function_kind})")
 
 
 def cmd_find_type(g: BeliefGraph, name: str) -> None:
     """Find type/class/interface/enum definitions matching a name pattern.
 
-    Searches cls, ifc, typ, enm entities.
+    Searches cls, mod, ifc, typ, enm entities.
     """
     parsed_pattern = parse_search_pattern(name)
     if isinstance(parsed_pattern, SearchPatternErr):
@@ -1493,7 +1520,7 @@ def cmd_find_type(g: BeliefGraph, name: str) -> None:
 
     for ent_name, ent_list in g.entity_by_name.items():
         for ent in ent_list:
-            if ent.kind in ("cls", "ifc", "typ", "enm"):
+            if ent.kind in ("cls", "mod", "ifc", "typ", "enm"):
                 if (
                     ent_name == name
                     or search_pattern_matches(parsed_pattern.value, ent_name)
@@ -1524,16 +1551,28 @@ def _resolve_fn_entity(g: BeliefGraph, fn_name: str) -> list[tuple[str, EntityFa
     pattern = re.compile(re.escape(fn_name), re.IGNORECASE)
     results: list[tuple[str, EntityFact]] = []
 
+    precise_methods: set[tuple[str, str]] = set()
     for ent_name, ent_list in g.entity_by_name.items():
         for ent in ent_list:
-            if ent.kind == "fn" and (ent_name == fn_name or pattern.search(ent_name)):
+            if ent.kind != "fn":
+                continue
+            short_name = _short_function_name(ent_name)
+            precise_methods.add((ent.module, short_name))
+            if (
+                ent_name == fn_name
+                or short_name == fn_name
+                or pattern.search(ent_name)
+                or pattern.search(short_name)
+            ):
                 results.append((f"{ent.module}::{ent_name}", ent))
 
-    # Also search class methods
+    # Also search class and module methods
     for _mod, ent_list in g.entities.items():
         for ent in ent_list:
-            if ent.kind == "cls" and ent.methods:
+            if ent.kind in ("cls", "mod") and ent.methods:
                 for method in ent.methods:
+                    if (ent.module, method) in precise_methods:
+                        continue
                     if method == fn_name or pattern.search(method):
                         results.append((f"{ent.module}::{method}", ent))
 
@@ -2245,9 +2284,12 @@ class _SchemeEval:
             result: set[str] = set()
             for ent_name, ent_list in g.entity_by_name.items():
                 for ent in ent_list:
+                    short_name = _short_function_name(ent_name)
                     if ent.kind == "fn" and (
                         ent_name == name
+                        or short_name == name
                         or search_pattern_matches(parsed_pattern.value, ent_name)
+                        or search_pattern_matches(parsed_pattern.value, short_name)
                     ):
                         result.add(ent.module)
             return result
@@ -2260,7 +2302,7 @@ class _SchemeEval:
             result = set()
             for ent_name, ent_list in g.entity_by_name.items():
                 for ent in ent_list:
-                    if ent.kind in ("cls", "ifc", "typ", "enm") and (
+                    if ent.kind in ("cls", "mod", "ifc", "typ", "enm") and (
                         ent_name == name
                         or search_pattern_matches(parsed_pattern.value, ent_name)
                     ):

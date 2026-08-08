@@ -13,6 +13,7 @@ from .interface import (
 from .java import JAVA_LANGUAGE
 from .python import PYTHON_LANGUAGE
 from .rust import RUST_LANGUAGE
+from .ruby import RUBY_LANGUAGE
 from .typescript import TYPESCRIPT_LANGUAGE
 
 
@@ -27,6 +28,7 @@ LANGUAGES: tuple[Language, ...] = (
     CSHARP_LANGUAGE,
     JAVA_LANGUAGE,
     GO_LANGUAGE,
+    RUBY_LANGUAGE,
 )
 
 

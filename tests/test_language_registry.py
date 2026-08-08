@@ -16,6 +16,7 @@ from scripts.lang.go import GO_LANGUAGE
 from scripts.lang.java import JAVA_LANGUAGE
 from scripts.lang.python import PYTHON_LANGUAGE
 from scripts.lang.rust import RUST_LANGUAGE
+from scripts.lang.ruby import RUBY_LANGUAGE
 from scripts.lang.typescript import TYPESCRIPT_LANGUAGE
 
 
@@ -29,6 +30,8 @@ class LanguageRegistryTests(unittest.TestCase):
         self.assertIs(CSHARP_LANGUAGE, language_for_file("Controller.cs"))
         self.assertIs(JAVA_LANGUAGE, language_for_file("Controller.java"))
         self.assertIs(GO_LANGUAGE, language_for_file("main.go"))
+        self.assertIs(RUBY_LANGUAGE, language_for_file("model.rb"))
+        self.assertIs(RUBY_LANGUAGE, language_for_file("tasks.rake"))
         self.assertIsNone(language_for_file("generated.d.ts"))
 
     def test_language_implementations_parse_their_source_contracts(self) -> None:
@@ -116,7 +119,7 @@ class LanguageRegistryTests(unittest.TestCase):
 
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertIn(
-                "Found 6 source files (1 py, 1 ts, 1 rs, 1 cs, 1 java, 1 go)",
+                "Found 6 source files (1 py, 1 ts, 1 rs, 1 cs, 1 java, 1 go, 0 rb)",
                 completed.stdout,
             )
             self.assertTrue((target / ".belief_map.sexp").is_file())

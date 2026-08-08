@@ -1,6 +1,7 @@
 # S-expression Output Notation
 
-Every output line is a self-contained fact. Each fact that references a module carries `:lang` (py/ts/tsx).
+Every output line is a self-contained fact. Each fact that references a module
+carries a compact `:lang` value such as `py`, `ts`, `rs`, or `rb`.
 
 **Module ID**: relative path from workspace root, no extension, no `/index`. Example: `drive/modules/drive_db/api/drive_db_api.ts` -> `drive/modules/drive_db/api/drive_db_api`.
 
@@ -10,13 +11,14 @@ Every output line is a self-contained fact. Each fact that references a module c
 (node <id> <lang> "<purpose>" :naming <convention> :pkg <repo>)
 (fn <mod> <name> <line> :eid <uuid>)
 (cls <mod> <name> <line> :eid <uuid> (:bases A) (:deco D) (:methods m1 m2))
+(mod <mod> <name> <line> :eid <uuid> (:methods m1 m2))
 (ifc <mod> <name> <line> :eid <uuid> (:methods m1 m2))
 (typ <mod> <name> <line> :eid <uuid>)
 (enm <mod> <name> <line> :eid <uuid>)
-(imports <src> <tgt> [:via-base] [:lsp])
+(imports <src> <tgt> [:via-base] [:association|:concern|:job|:mailer|:spec] [:lsp])
 (calls-api <src> <tgt> :via-ifc [:lsp])
 (data-flow <src> <tgt> [:validated])
-(refs <src> <tgt>::<Entity> [:lsp])
+(refs <src> <tgt>::<Entity> [:callback] [:lsp])
 (calls <src>::<fn> <tgt>::<fn> :lines L1 L2 :lsp)
 ```
 
@@ -160,6 +162,11 @@ Every output line is a self-contained fact. Each fact that references a module c
 | `py` | Python | snake_case fns, PascalCase classes | `drive_path_to_entry`, `DrivePath` |
 | `ts` | TypeScript | camelCase fns, PascalCase classes | `calculateTotal`, `OperativesService` |
 | `tsx` | TSX/React | PascalCase components, camelCase hooks | `FileBrowser`, `useQuery` |
+| `rs` | Rust | snake_case modules and functions | `drive_path`, `DrivePath` |
+| `cs` | C# | PascalCase types | `DriveController` |
+| `java` | Java | PascalCase types | `DriveService` |
+| `go` | Go | PascalCase exports, camelCase locals | `DrivePath`, `loadPath` |
+| `rb` | Ruby/Rails | snake_case files, CamelCase constants | `order_payment`, `OrderPayment` |
 
 ## Architecture Layers
 

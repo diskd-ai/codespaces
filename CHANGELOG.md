@@ -4,6 +4,12 @@
 
 ### Changes
 
+- Added dynamically loaded Ruby and Ruby on Rails indexing for `.rb` and
+  `.rake` files, including classes, modules, instance and singleton methods,
+  inheritance, explicit requires, and Ruby LSP metadata.
+- Added conservative Rails/Zeitwerk dependency resolution for application and
+  custom autoload roots, project acronyms, concerns, associations, callbacks,
+  jobs, mailers, and impacted specs.
 - Added official Tree-sitter support for C#, Java, and Go source discovery,
   entity extraction, local dependency resolution, project recognition, and LSP
   metadata.
@@ -23,6 +29,10 @@
 
 ### Fixes
 
+- Prevented ambiguous or reopened Ruby constants, polymorphic associations, and
+  RSpec `include` matchers from creating guessed Rails dependency edges.
+- Resolved inherited Ruby constants and `through` associations with explicit
+  `source` models, and preserved Rails relation types in map facts.
 - Excluded standard .NET `bin`/`obj` outputs and Go `vendor` dependencies from
   source discovery.
 - Prevented unused C# namespace and Java wildcard imports from creating guessed

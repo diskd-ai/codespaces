@@ -3,6 +3,17 @@
 ## 2026-08-08
 
 ### Changes
+- Added a dynamically loaded Ruby adapter under `scripts/lang/ruby` using the
+  official Python `tree-sitter-ruby` grammar, with `.rb`/`.rake` discovery,
+  declarations, qualified modules, methods, inheritance, and explicit requires.
+- Added project-local Rails/Zeitwerk resolution for application roots, custom
+  static autoload roots, acronyms, concerns, associations, callbacks, jobs,
+  mailers, specs, and inherited constants.
+- Added explicit `:association`, `:concern`, `:callback`, `:job`, `:mailer`, and
+  `:spec` relationship metadata while keeping ambiguous and polymorphic targets
+  fail-closed.
+- Added an exact Ruby-only dependency manifest so repositories without Ruby do
+  not install or load the Ruby grammar.
 - Added a language-neutral `Language` protocol and registry for source
   ownership, parsing, import resolution, module IDs, output codes, and LSP
   configuration.
@@ -24,6 +35,18 @@
   AI-agent workflows.
 
 ### Fixes
+- Verified Ruby support on `/Users/alexeus/src/masha`: all 244 Ruby/Rake files
+  parsed without syntax errors in 2.82 seconds, producing 244 nodes, 881
+  entities, and 852 edges in a 120,660-byte map. A second build reused all 244
+  cached results and completed in 2.04 seconds.
+- A source-independent static oracle matched all reviewable inheritance (67),
+  concern (11), association (30), job (9), mailer (2), and spec-impact (94)
+  edges, measuring 100% precision and recall for each category. The constant
+  index uniquely resolved 343 references, left 6 ambiguous references unlinked,
+  and classified the remaining 337 as external or dynamic.
+- Prevented RSpec `include(...)` matchers from appearing as concern edges,
+  resolved constants inherited from local Ruby superclasses, respected
+  association `source`, and left polymorphic associations open.
 - Parser dispatch now surfaces unsupported languages and parse failures instead
   of silently dropping failed files.
 - Preserved the hardened explicit-root, collision, cache-provenance, atomic
@@ -49,6 +72,9 @@
   packages now produce a targeted install command without publishing artifacts.
 
 ### Motivation
+- Make Rails model, concern, service, job, mailer, and spec blast-radius search
+  useful without booting the application or installing Ruby dependencies for
+  repositories that do not contain Ruby.
 - Make new source-language support additive at one explicit boundary, prove
   Rust, C#, Java, and Go coverage on real source repositories, and make the
   project easier to find and use without weakening existing graph correctness

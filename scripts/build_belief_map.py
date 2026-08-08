@@ -22,17 +22,19 @@ Parsers
   methods, annotations, inheritance, and local type dependencies.
 - **Go**: tree-sitter (``tree-sitter-go``). Handles modules, packages, types,
   functions, receiver methods, and local package dependencies.
+- **Ruby**: tree-sitter (``tree-sitter-ruby``). Handles Ruby declarations,
+  Rails/Zeitwerk constants, mixins, associations, jobs, mailers, and specs.
 
 Modes
 -----
 **Default** (fast, ~5-8s for full workspace):
-    Parses all .py/.ts/.tsx/.rs/.cs/.java/.go files and builds
+    Parses all .py/.ts/.tsx/.rs/.cs/.java/.go/.rb/.rake files and builds
     import/reference/data-flow edges.
 
 **LSP-enhanced** (``--lsp``, ~1-5min):
     After default pass, starts ``typescript-language-server`` and
-    ``pyright-langserver``, ``rust-analyzer``, ``csharp-ls``, ``jdtls``, or
-    ``gopls`` per project to query call hierarchy and references. Adds precise
+    ``pyright-langserver``, ``rust-analyzer``, ``csharp-ls``, ``jdtls``,
+    ``gopls``, or ``ruby-lsp`` per project to query call hierarchy and references. Adds precise
     ``calls`` edges and ``:lsp`` annotations.
 
 Edge Types
@@ -65,12 +67,13 @@ only for languages present in the target repository::
     python3 -m pip install -r requirements/csharp.txt
     python3 -m pip install -r requirements/java.txt
     python3 -m pip install -r requirements/go.txt
+    python3 -m pip install -r requirements/ruby.txt
 
 The builder detects missing or incompatible packages before publication and
 prints only the commands required by the discovered languages.
 
 Optional for ``--lsp``: ``typescript-language-server``, ``pyright-langserver``,
-``rust-analyzer``, ``csharp-ls``, ``jdtls``, or ``gopls``.
+``rust-analyzer``, ``csharp-ls``, ``jdtls``, ``gopls``, or ``ruby-lsp``.
 
 Usage
 -----
@@ -156,7 +159,7 @@ CACHE_FILE = ".belief_map_cache.json"
 OUTPUT_FILE = ".belief_map.sexp"
 CACHE_SCHEMA_VERSION = 1
 MAP_SCHEMA_VERSION = 1
-BUILDER_CONFIG_VERSION = "2026-08-08"
+BUILDER_CONFIG_VERSION = "2026-08-08-ruby"
 
 # Default timeout for LSP requests (seconds)
 LSP_REQUEST_TIMEOUT = 15.0
@@ -513,6 +516,7 @@ def decode_cache_entry(entry: object) -> Result[FileResult, str]:
         "entities",
         "imported_names",
         "exported_names",
+        "relations",
     )
     for field_name in list_fields:
         if not isinstance(raw_result.get(field_name), list):
@@ -614,6 +618,29 @@ def _resolve_provider(
     return None
 
 
+def _resolve_target_entity(
+    entities: Sequence[EntityPayload],
+    original_name: str,
+    local_name: str,
+) -> str | None:
+    exact_matches = [
+        entity["name"]
+        for entity in entities
+        if entity["name"] == original_name
+        or (original_name == "default" and entity["name"] == local_name)
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if exact_matches:
+        return None
+    short_matches = [
+        entity["name"]
+        for entity in entities
+        if entity["name"].rsplit("::", 1)[-1] == original_name
+    ]
+    return short_matches[0] if len(short_matches) == 1 else None
+
+
 def build_graph(
     results: list[FileResult], root: str,
 ) -> Result[GraphBuildOutput, GraphBuildError]:
@@ -691,37 +718,73 @@ def build_graph(
             node["entities"] = r.entities
         nodes.append(node)
 
-        # Some language forms carry additional local import targets.
-        extra_submod_ids = bound_language.resolve_additional_imports(r)
-        for target_id in extra_submod_ids:
+        # Resolve all module dependencies before emission so relationship
+        # metadata is merged onto one deterministic import edge.
+        resolved_imports: dict[str, set[str]] = {}
+        for target_id in bound_language.resolve_additional_imports(r):
             if target_id != node_id:
-                edge_key = (node_id, target_id, "IMPORTS")
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    target_r = id_to_result.get(target_id)
-                    via_base = bool(target_r and target_r.exports_abstract)
-                    edges.append({
-                        "source": node_id,
-                        "target": target_id,
-                        "type": "IMPORTS",
-                        "via_base": via_base,
-                    })
-
-        # -- module-level IMPORTS edges --
+                resolved_imports.setdefault(target_id, set())
         for imp in r.imports:
             target_id = bound_language.resolve_import(imp, r.path)
             if target_id and target_id != node_id:
-                edge_key = (node_id, target_id, "IMPORTS")
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    target_r = id_to_result.get(target_id)
-                    via_base = bool(target_r and target_r.exports_abstract)
-                    edges.append({
-                        "source": node_id,
-                        "target": target_id,
-                        "type": "IMPORTS",
-                        "via_base": via_base,
-                    })
+                resolved_imports.setdefault(target_id, set())
+        for relation in r.relations:
+            target_id = bound_language.resolve_import(
+                relation["target"],
+                r.path,
+            )
+            if target_id and target_id != node_id:
+                resolved_imports.setdefault(target_id, set()).add(
+                    relation["relation"]
+                )
+
+        local_entities = {
+            entity["name"]
+            for entity in r.entities
+        }
+        for relation in r.relations:
+            source_entity = relation.get("source_entity", "")
+            target_entity = relation.get("target_entity", "")
+            if not source_entity or not target_entity:
+                continue
+            target_id = bound_language.resolve_import(
+                relation["target"],
+                r.path,
+            )
+            if (
+                target_id != node_id
+                or source_entity not in local_entities
+                or target_entity not in local_entities
+            ):
+                continue
+            source_ref = f"{node_id}::{source_entity}"
+            target_ref = f"{node_id}::{target_entity}"
+            edge_key = (source_ref, target_ref, "REFERENCES")
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            edges.append({
+                "source": source_ref,
+                "target": target_ref,
+                "type": "REFERENCES",
+                "relations": [relation["relation"]],
+            })
+
+        # -- module-level IMPORTS edges --
+        for target_id, relations in sorted(resolved_imports.items()):
+            edge_key = (node_id, target_id, "IMPORTS")
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            target_r = id_to_result.get(target_id)
+            via_base = bool(target_r and target_r.exports_abstract)
+            edges.append({
+                "source": node_id,
+                "target": target_id,
+                "type": "IMPORTS",
+                "via_base": via_base,
+                "relations": sorted(relations),
+            })
 
         # -- CALLS_API edges (implements/extends + entity :bases) --
         # Source 1: FileResult.implements + extends (from heritage clauses)
@@ -793,11 +856,11 @@ def build_graph(
             local = imp_name["local"]
 
             # Find matching entity in target
-            target_entity = None
-            for ent in target_r.entities:
-                if ent["name"] == orig or (orig == "default" and ent["name"] == local):
-                    target_entity = ent["name"]
-                    break
+            target_entity = _resolve_target_entity(
+                target_r.entities,
+                orig,
+                local,
+            )
             if not target_entity:
                 # Still useful: the name is exported even if not a class/function entity
                 if orig in target_r.exported_names:
@@ -2193,7 +2256,7 @@ def render_sexp(
             eid = _entity_id(node["id"], name)
             kind_tag = {
                 "class": "cls", "function": "fn", "interface": "ifc",
-                "type": "typ", "enum": "enm",
+                "module": "mod", "type": "typ", "enum": "enm",
             }.get(kind, kind[:3])
 
             bases = ent.get("bases", [])
@@ -2223,8 +2286,14 @@ def render_sexp(
 
         if etype == "IMPORTS":
             flags = " :via-base" if edge.get("via_base") else ""
+            relation_flags = "".join(
+                f" :{relation}"
+                for relation in sorted(edge.get("relations", []))
+            )
             lsp = " :lsp" if edge.get("lsp_verified") else ""
-            lines.append(f"(imports {src} {tgt}{flags}{lsp})")
+            lines.append(
+                f"(imports {src} {tgt}{flags}{relation_flags}{lsp})"
+            )
         elif etype == "CALLS_API":
             lsp = " :lsp" if edge.get("lsp_verified") else ""
             lines.append(f"(calls-api {src} {tgt} :via-ifc{lsp})")
@@ -2232,8 +2301,12 @@ def render_sexp(
             flags = " :validated" if edge.get("validated") else ""
             lines.append(f"(data-flow {src} {tgt}{flags})")
         elif etype == "REFERENCES":
+            relation_flags = "".join(
+                f" :{relation}"
+                for relation in sorted(edge.get("relations", []))
+            )
             lsp = " :lsp" if edge.get("lsp_verified") else ""
-            lines.append(f"(refs {src} {tgt}{lsp})")
+            lines.append(f"(refs {src} {tgt}{relation_flags}{lsp})")
         elif etype == "CALLS":
             fl = edge.get("from_lines", [])
             lns = f" :lines {' '.join(str(line) for line in fl)}" if fl else ""
@@ -2380,6 +2453,7 @@ def _serialize_file_result(result: FileResult) -> dict:
             "entities": result.entities,
             "imported_names": result.imported_names,
             "exported_names": result.exported_names,
+            "relations": result.relations,
         },
     }
 

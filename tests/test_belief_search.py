@@ -7,18 +7,24 @@ import textwrap
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Protocol
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "belief_search.py"
 SPEC = importlib.util.spec_from_file_location("belief_search", SCRIPT_PATH)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError(f"Could not load belief search module from {SCRIPT_PATH}")
 belief_search = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
 sys.modules[SPEC.name] = belief_search
 SPEC.loader.exec_module(belief_search)
 
 
+class BeliefGraphContract(Protocol):
+    def resolve_module(self, query: str) -> list[str]: ...
+
+
 class BeliefSearchAliasTest(unittest.TestCase):
-    def _load_graph(self) -> tuple[object, str]:
+    def _load_graph(self) -> tuple[BeliefGraphContract, str]:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
 
@@ -195,6 +201,42 @@ class BeliefSearchAliasTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("depth must be an integer", result.stdout)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
+
+    def test_qualified_ruby_method_is_not_duplicated_by_class_summary(self) -> None:
+        """/* REQ-RUBY-010: Function search returns the precise Ruby method entity once when a class also lists that method. */"""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        sexp_path = Path(tmpdir.name) / ".belief_map.sexp"
+        sexp_path.write_text(
+            textwrap.dedent(
+                """
+                (belief-map :schema 1 :files 1 :nodes 1 :edges 0 :violations 0)
+                (paths
+                  (app
+                    (services
+                      (charge rb0)
+                    )
+                  )
+                )
+                (node rb0 rb service :naming snake_case :pkg example)
+                (cls rb0 Billing::Charge 3 (:methods call))
+                (fn rb0 Billing::Charge#call 9)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        graph = belief_search.BeliefGraph()
+        load_result = graph.load(str(sexp_path))
+        self.assertIsInstance(load_result, belief_search.MapLoadOk)
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            belief_search.cmd_find_function(graph, "call")
+
+        result_lines = output.getvalue().splitlines()
+        self.assertEqual(1, len(result_lines))
+        self.assertIn("Billing::Charge#call :line 9", result_lines[0])
 
 
 if __name__ == "__main__":

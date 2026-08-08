@@ -43,7 +43,19 @@ def infer_purpose(
     rel = path.lower()
 
     # Path-based heuristics
-    if "/domain/" in rel:
+    if language == "ruby" and "/app/models/" in rel:
+        parts.append("data model")
+    elif language == "ruby" and "/app/controllers/" in rel:
+        parts.append("API controller")
+    elif language == "ruby" and "/app/services/" in rel:
+        parts.append("service")
+    elif language == "ruby" and "/app/jobs/" in rel:
+        parts.append("worker")
+    elif language == "ruby" and "/app/mailers/" in rel:
+        parts.append("mailer")
+    elif language == "ruby" and "/spec/" in rel:
+        parts.append("test")
+    elif "/domain/" in rel:
         parts.append("domain logic")
     elif "/infrastructure/" in rel or "/infra/" in rel:
         parts.append("infrastructure adapter")

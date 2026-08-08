@@ -6,9 +6,9 @@
 
 Understand a large codebase before you change it. Codespaces is an
 architecture-aware code search tool for Python, TypeScript, TSX, Rust, C#,
-Java, and Go repositories. It helps developers and AI coding agents find the
-right module, trace dependencies, measure change impact, and read only the
-source files that matter.
+Java, Go, Ruby, and Ruby on Rails repositories. It helps developers and AI
+coding agents find the right module, trace dependencies, measure change impact,
+and read only the source files that matter.
 
 Use it for codebase architecture discovery, dependency graph search, blast-radius
 analysis, call-flow tracing, monorepo navigation, and safer AI-assisted coding.
@@ -21,6 +21,7 @@ analysis, call-flow tracing, monorepo navigation, and safer AI-assisted coding.
 - Which two or three files should I read before fixing a bug?
 - How does a request or data value move through the system?
 - Does this dependency cross an architecture boundary?
+- Which Rails models, services, jobs, mailers, concerns, and specs are affected?
 - Can you draw a call-flow, data-flow, or sequence diagram from the code?
 
 Instead of searching a repository one text match at a time, Codespaces turns code
@@ -69,6 +70,7 @@ example:
 ```bash
 python3 -m pip install -r requirements/typescript.txt
 python3 -m pip install -r requirements/csharp.txt
+python3 -m pip install -r requirements/ruby.txt
 ```
 
 Install only the files for languages you use, then run the same build command
@@ -97,7 +99,7 @@ files it analyzes.
 | Find files needed for a change | `boundary path/to/module --files-only` |
 | Trace dependencies | `deps path/to/module 2` |
 | Measure blast radius | `rdeps path/to/module 2` |
-| Find a class, interface, enum, or type | `find_type OrderService` |
+| Find a class, module, interface, enum, or type | `find_type OrderService` |
 | Find a function or method | `find_function createOrder` |
 | Find callers | `find_callers createOrder 2` |
 | Trace a call path | `find_callchain handleRequest createOrder 5` |
@@ -119,13 +121,27 @@ is outside the current directory.
 | C# | Namespaces, types, interfaces, records, enums, methods, attributes, inheritance, and local type dependencies |
 | Java | Packages, imports, classes, interfaces, records, enums, methods, annotations, inheritance, and local type dependencies |
 | Go | Modules, packages, imports, structs, interfaces, functions, constants, variables, receiver methods, and local package dependencies |
+| Ruby and Rails | Ruby classes, modules, instance and singleton methods, inheritance, requires, Zeitwerk constants, concerns, associations, callbacks, jobs, mailers, and impacted specs |
 
 Codespaces is designed for single repositories and monorepos. It understands
 Python project roots, TypeScript configuration and package aliases, Cargo package
 names and local Rust crate dependencies, .NET solutions and projects, Maven and
-Gradle projects, and Go modules and workspaces.
+Gradle projects, Go modules and workspaces, and Rails application/autoload
+roots with project acronyms.
 
 It can also map infrastructure relationships from Kustomize, Helm, and Terraform.
+
+## Ruby and Rails dependency search
+
+Rails code often depends on constants without an explicit `require`. Codespaces
+builds a project-local constant index and follows conservative Zeitwerk naming
+rules, so changing a shared model, concern, service, job, or mailer can reveal
+its likely callers and affected specs.
+
+The default Ruby map does not boot Rails. Ambiguous reopened constants remain
+unlinked, polymorphic associations stay open, and external or dynamic Ruby
+calls are not guessed. This keeps blast-radius results useful without executing
+application code.
 
 ## A simple workflow
 
