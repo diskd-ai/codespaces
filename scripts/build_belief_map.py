@@ -57,9 +57,17 @@ Flat S-expression facts (``belief_map.sexp``)::
 
 Requirements
 ------------
-::
+Python indexing uses the standard library only. Install exact parser packages
+only for languages present in the target repository::
 
-    python3 -m pip install -r requirements.txt
+    python3 -m pip install -r requirements/typescript.txt
+    python3 -m pip install -r requirements/rust.txt
+    python3 -m pip install -r requirements/csharp.txt
+    python3 -m pip install -r requirements/java.txt
+    python3 -m pip install -r requirements/go.txt
+
+The builder detects missing or incompatible packages before publication and
+prints only the commands required by the discovered languages.
 
 Optional for ``--lsp``: ``typescript-language-server``, ``pyright-langserver``,
 ``rust-analyzer``, ``csharp-ls``, ``jdtls``, or ``gopls``.
@@ -102,6 +110,7 @@ try:
             LANGUAGES,
             BoundLanguage,
             FileResult,
+            Language,
             language_for_file,
             language_for_name,
             language_for_result,
@@ -115,6 +124,7 @@ try:
             LANGUAGES,
             BoundLanguage,
             FileResult,
+            Language,
             language_for_file,
             language_for_name,
             language_for_result,
@@ -288,12 +298,80 @@ def discover_files(root: str) -> list[tuple[str, str, str]]:
 # Incremental cache
 # ---------------------------------------------------------------------------
 
-def _builder_fingerprint() -> str:
-    """Fingerprint parser code, dependencies, and behavior-affecting config."""
+@dataclass(frozen=True)
+class LanguageDependencyIssue:
+    language: Language
+    unavailable: tuple[str, ...]
+
+
+def _active_languages(language_names: frozenset[str]) -> tuple[Language, ...]:
+    return tuple(
+        language for language in LANGUAGES if language.name in language_names
+    )
+
+
+def _dependency_issues(
+    language_names: frozenset[str],
+) -> tuple[LanguageDependencyIssue, ...]:
+    issues: list[LanguageDependencyIssue] = []
+    for language in _active_languages(language_names):
+        unavailable: list[str] = []
+        for dependency in language.dependencies:
+            try:
+                installed_version = importlib.metadata.version(
+                    dependency.distribution
+                )
+            except importlib.metadata.PackageNotFoundError:
+                unavailable.append(f"{dependency.requirement} (missing)")
+                continue
+            if installed_version != dependency.version:
+                unavailable.append(
+                    f"{dependency.requirement} (installed {installed_version})"
+                )
+        if unavailable:
+            issues.append(LanguageDependencyIssue(language, tuple(unavailable)))
+    return tuple(issues)
+
+
+def _report_dependency_issues(
+    issues: tuple[LanguageDependencyIssue, ...],
+) -> None:
+    print(
+        "[belief-map] ERROR: parser dependencies are missing or incompatible:",
+        file=sys.stderr,
+    )
+    for issue in issues:
+        print(
+            f"[belief-map]   {issue.language.display_name}: "
+            f"{', '.join(issue.unavailable)}",
+            file=sys.stderr,
+        )
+    print(
+        "[belief-map] Install only the detected language dependencies:",
+        file=sys.stderr,
+    )
+    skill_root = Path(__file__).resolve().parent.parent
+    for issue in issues:
+        requirements_path = (
+            skill_root / "requirements" / f"{issue.language.name}.txt"
+        )
+        print(
+            f'[belief-map]   python3 -m pip install -r "{requirements_path}"',
+            file=sys.stderr,
+        )
+    print(
+        "[belief-map] ERROR: no cache or map was published",
+        file=sys.stderr,
+    )
+
+
+def _builder_fingerprint(language_names: frozenset[str]) -> str:
+    """Fingerprint active parsers, dependencies, and shared configuration."""
+    active_languages = _active_languages(language_names)
     dependency_packages = sorted({
-        package
-        for language in LANGUAGES
-        for package in language.dependency_packages
+        dependency.distribution
+        for language in active_languages
+        for dependency in language.dependencies
     })
     dependency_versions = "|".join(
         f"{name}={importlib.metadata.version(name)}"
@@ -302,16 +380,19 @@ def _builder_fingerprint() -> str:
     config = "|".join(
         (
             BUILDER_CONFIG_VERSION,
+            ",".join(sorted(language_names)),
             dependency_versions,
             ",".join(sorted(SKIP_DIRS)),
         )
     )
     digest = hashlib.sha256()
     digest.update(config.encode("utf-8"))
-    source_paths = (
-        Path(__file__),
-        *sorted((Path(__file__).parent / "lang").rglob("*.py")),
-    )
+    language_root = Path(__file__).parent / "lang"
+    source_paths = [Path(__file__), *sorted(language_root.glob("*.py"))]
+    for language in active_languages:
+        source_paths.extend(
+            sorted((language_root / language.name).rglob("*.py"))
+        )
     for source_path in source_paths:
         digest.update(str(source_path.relative_to(Path(__file__).parent)).encode())
         with open(source_path, "rb") as source:
@@ -352,7 +433,7 @@ def _atomic_write_text(path: str, content: str) -> None:
         raise
 
 
-def load_cache(root: str) -> dict:
+def load_cache(root: str, language_names: frozenset[str]) -> dict:
     """Load compatible cache entries or rebuild with an explicit warning."""
     cache_path = os.path.join(root, CACHE_FILE)
     if not os.path.exists(cache_path):
@@ -375,7 +456,7 @@ def load_cache(root: str) -> dict:
             file=sys.stderr,
         )
         return {}
-    expected_fingerprint = _builder_fingerprint()
+    expected_fingerprint = _builder_fingerprint(language_names)
     if (
         cache.get("schema_version") != CACHE_SCHEMA_VERSION
         or cache.get("builder_fingerprint") != expected_fingerprint
@@ -393,11 +474,15 @@ def load_cache(root: str) -> dict:
     return {}
 
 
-def save_cache(root: str, entries: dict) -> None:
+def save_cache(
+    root: str,
+    entries: dict,
+    language_names: frozenset[str],
+) -> None:
     cache_path = os.path.join(root, CACHE_FILE)
     cache = {
         "schema_version": CACHE_SCHEMA_VERSION,
-        "builder_fingerprint": _builder_fingerprint(),
+        "builder_fingerprint": _builder_fingerprint(language_names),
         "entries": entries,
     }
     serialized = json.dumps(cache, sort_keys=True, separators=(",", ":")) + "\n"
@@ -2324,7 +2409,19 @@ def _run_build(options: BuilderOptions) -> int:
     print(f"[belief-map] Found {len(files)} source files ({count_summary})")
     print(f"[belief-map] Supported source: {extensions}")
 
-    cache = {} if options.full_rebuild else load_cache(root)
+    active_language_names = frozenset(
+        language_name for _, language_name, _ in files
+    )
+    dependency_issues = _dependency_issues(active_language_names)
+    if dependency_issues:
+        _report_dependency_issues(dependency_issues)
+        return 2
+
+    cache = (
+        {}
+        if options.full_rebuild
+        else load_cache(root, active_language_names)
+    )
     to_parse: list[tuple[str, str, str]] = []
     cached_results: list[FileResult] = []
 
@@ -2401,7 +2498,7 @@ def _run_build(options: BuilderOptions) -> int:
         for result in all_results
     }
     map_content = render_sexp(nodes, edges, root, mode, len(all_results))
-    save_cache(root, new_cache)
+    save_cache(root, new_cache, active_language_names)
     _atomic_write_text(options.output_path, map_content)
 
     elapsed = time.monotonic() - t0

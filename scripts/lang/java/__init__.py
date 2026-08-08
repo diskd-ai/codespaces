@@ -3,9 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult
+from ..interface import BoundLanguage, FileResult, LanguageDependency
 from .imports import BoundJavaLanguage
-from .parser import parse_java_treesitter
+
+
+def parse_java_treesitter(
+    path: str,
+    content: str,
+    repo: str,
+    mtime: float,
+) -> FileResult:
+    from .parser import parse_java_treesitter as parse_java
+
+    return parse_java(path, content, repo, mtime)
 
 
 @dataclass(frozen=True)
@@ -20,10 +30,11 @@ class JavaLanguage:
     )
     lsp_command: tuple[str, ...] = ("jdtls",)
     lsp_label: str = "Java"
+    display_name: str = "Java"
     cli_label: str = "java"
-    dependency_packages: tuple[str, ...] = (
-        "tree-sitter",
-        "tree-sitter-java",
+    dependencies: tuple[LanguageDependency, ...] = (
+        LanguageDependency("tree-sitter", "0.25.2"),
+        LanguageDependency("tree-sitter-java", "0.23.5"),
     )
     source_extensions: tuple[str, ...] = (".java",)
 

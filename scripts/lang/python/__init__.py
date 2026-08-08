@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult
+from ..interface import BoundLanguage, FileResult, LanguageDependency
 from .imports import BoundPythonLanguage
 from .parser import parse_python
 
@@ -19,8 +19,9 @@ class PythonLanguage:
     )
     lsp_command: tuple[str, ...] = ("pyright-langserver", "--stdio")
     lsp_label: str = "Py"
+    display_name: str = "Python"
     cli_label: str = "py"
-    dependency_packages: tuple[str, ...] = ()
+    dependencies: tuple[LanguageDependency, ...] = ()
     source_extensions: tuple[str, ...] = (".py",)
 
     def accepts_file(self, file_name: str) -> bool:

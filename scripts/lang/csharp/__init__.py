@@ -3,9 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult
+from ..interface import BoundLanguage, FileResult, LanguageDependency
 from .imports import BoundCSharpLanguage
-from .parser import parse_csharp_treesitter
+
+
+def parse_csharp_treesitter(
+    path: str,
+    content: str,
+    repo: str,
+    mtime: float,
+) -> FileResult:
+    from .parser import parse_csharp_treesitter as parse_csharp
+
+    return parse_csharp(path, content, repo, mtime)
 
 
 @dataclass(frozen=True)
@@ -16,10 +26,11 @@ class CSharpLanguage:
     project_config_names: tuple[str, ...] = (".sln", ".csproj")
     lsp_command: tuple[str, ...] = ("csharp-ls",)
     lsp_label: str = "C#"
+    display_name: str = "C#"
     cli_label: str = "cs"
-    dependency_packages: tuple[str, ...] = (
-        "tree-sitter",
-        "tree-sitter-c-sharp",
+    dependencies: tuple[LanguageDependency, ...] = (
+        LanguageDependency("tree-sitter", "0.25.2"),
+        LanguageDependency("tree-sitter-c-sharp", "0.23.5"),
     )
     source_extensions: tuple[str, ...] = (".cs",)
 

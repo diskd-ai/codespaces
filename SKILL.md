@@ -32,10 +32,21 @@ Locate the belief map. If absent, build it:
 ls .belief_map.sexp belief_map.sexp 2>/dev/null
 SKILL_ROOT="$(pwd -P)"
 TARGET_ROOT="$(cd /absolute/path/to/project && pwd -P)"
-python3 -m pip install -r "$SKILL_ROOT/requirements.txt"
 python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT"
 python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --full
 ```
+
+Python indexing has no external parser dependency. For other detected
+languages, the first build fails before publication when a parser is absent or
+has the wrong version and prints the exact per-language command to run, such as:
+
+```bash
+python3 -m pip install -r "$SKILL_ROOT/requirements/typescript.txt"
+python3 -m pip install -r "$SKILL_ROOT/requirements/csharp.txt"
+```
+
+Install only the requirement files named by the builder, then rerun it.
+`requirements.txt` is reserved for the infrastructure-topology dependency.
 
 ## Mandatory Workflow: Query Before Code
 

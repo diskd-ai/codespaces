@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from .csharp import CSHARP_LANGUAGE
 from .go import GO_LANGUAGE
-from .interface import BoundLanguage, Entity, FileResult, ImportedName, Language
+from .interface import (
+    BoundLanguage,
+    Entity,
+    FileResult,
+    ImportedName,
+    Language,
+    LanguageDependency,
+)
 from .java import JAVA_LANGUAGE
 from .python import PYTHON_LANGUAGE
 from .rust import RUST_LANGUAGE
@@ -53,6 +60,7 @@ __all__ = [
     "ImportedName",
     "LANGUAGES",
     "Language",
+    "LanguageDependency",
     "UnsupportedLanguageError",
     "language_for_file",
     "language_for_name",

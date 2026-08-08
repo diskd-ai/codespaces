@@ -48,12 +48,11 @@ Skills.
 
 ## Quick start from the command line
 
-Clone the repository and install its pinned parser dependencies:
+Clone the repository:
 
 ```bash
 git clone https://github.com/diskd-ai/codespaces.git
 cd codespaces
-python3 -m pip install -r requirements.txt
 ```
 
 Build an architecture map for an explicit project directory:
@@ -61,6 +60,20 @@ Build an architecture map for an explicit project directory:
 ```bash
 python3 scripts/build_belief_map.py --root /absolute/path/to/project
 ```
+
+Parser packages are loaded only for languages found in that project. Python
+needs no extra parser package. If another detected language is not installed,
+the builder stops before publishing and prints its exact install command, for
+example:
+
+```bash
+python3 -m pip install -r requirements/typescript.txt
+python3 -m pip install -r requirements/csharp.txt
+```
+
+Install only the files for languages you use, then run the same build command
+again. `requirements.txt` contains the separate infrastructure-topology
+dependency.
 
 Run a relevant search and get the first matching module with its full context:
 

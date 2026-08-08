@@ -14,6 +14,9 @@
 - Added official Tree-sitter adapters for C#, Java, and Go with language-owned
   parsing, project recognition, module identity, local import resolution, and
   language-server metadata.
+- Moved Tree-sitter packages into exact per-language requirement files and made
+  parser loading, dependency validation, and cache provenance depend only on
+  languages discovered in the target repository.
 - Added focused registry, script-mode CLI, Rust parser, and Cargo dependency
   tests while retaining the hardened builder and TypeScript recall coverage.
 - Rewrote the README and public descriptions around user questions, quick code
@@ -41,6 +44,9 @@
   package edges instead.
 - Excluded .NET build output and Go vendored dependencies, and required an
   actual type reference before resolving C# namespaces or Java wildcards.
+- Verified a Python-only build with no site packages and a C#-only build with
+  only `tree-sitter` and `tree-sitter-c-sharp` installed; missing TypeScript
+  packages now produce a targeted install command without publishing artifacts.
 
 ### Motivation
 - Make new source-language support additive at one explicit boundary, prove

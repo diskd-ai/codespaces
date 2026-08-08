@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from ..interface import FileResult
-from .parser import declared_csharp_types
 
 
 def _freeze_index(index: dict[str, set[str]]) -> dict[str, tuple[str, ...]]:
@@ -21,6 +20,8 @@ class BoundCSharpLanguage:
 
     @classmethod
     def create(cls, path_to_id: Mapping[str, str]) -> BoundCSharpLanguage:
+        from .parser import declared_csharp_types
+
         type_index: dict[str, set[str]] = {}
         for path, node_id in sorted(path_to_id.items()):
             if not path.endswith(".cs"):

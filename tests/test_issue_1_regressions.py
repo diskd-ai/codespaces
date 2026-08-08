@@ -362,16 +362,28 @@ class IssueOneRegressionTest(unittest.TestCase):
             for key, value in os.environ.items()
             if key != "PYTHONPATH"
         }
-        result = subprocess.run(
-            [sys.executable, "-S", str(BUILD_SCRIPT)],
-            capture_output=True,
-            env=clean_environment,
-            text=True,
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "service.ts").write_text(
+                "export const execute = () => true;\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    str(BUILD_SCRIPT),
+                    "--root",
+                    str(root),
+                ],
+                capture_output=True,
+                env=clean_environment,
+                text=True,
+            )
 
         self.assertEqual(result.returncode, 2)
-        self.assertIn("missing Python dependency", result.stderr)
-        self.assertIn("requirements.txt", result.stderr)
+        self.assertIn("TypeScript", result.stderr)
+        self.assertIn("requirements/typescript.txt", result.stderr)
         self.assertNotIn("Traceback", result.stdout + result.stderr)
 
 

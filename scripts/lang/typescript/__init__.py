@@ -3,9 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult
+from ..interface import BoundLanguage, FileResult, LanguageDependency
 from .imports import BoundTypeScriptLanguage
-from .parser import parse_typescript_treesitter
+
+
+def parse_typescript_treesitter(
+    path: str,
+    content: str,
+    repo: str,
+    mtime: float,
+) -> FileResult:
+    from .parser import parse_typescript_treesitter as parse_typescript
+
+    return parse_typescript(path, content, repo, mtime)
 
 
 @dataclass(frozen=True)
@@ -16,10 +26,11 @@ class TypeScriptLanguage:
     project_config_names: tuple[str, ...] = ("tsconfig.json",)
     lsp_command: tuple[str, ...] = ("typescript-language-server", "--stdio")
     lsp_label: str = "TS"
+    display_name: str = "TypeScript"
     cli_label: str = "ts"
-    dependency_packages: tuple[str, ...] = (
-        "tree-sitter",
-        "tree-sitter-typescript",
+    dependencies: tuple[LanguageDependency, ...] = (
+        LanguageDependency("tree-sitter", "0.25.2"),
+        LanguageDependency("tree-sitter-typescript", "0.23.2"),
     )
     source_extensions: tuple[str, ...] = (".ts", ".tsx")
 

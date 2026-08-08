@@ -7,6 +7,9 @@
 - Added official Tree-sitter support for C#, Java, and Go source discovery,
   entity extraction, local dependency resolution, project recognition, and LSP
   metadata.
+- Made Tree-sitter grammars optional and language-scoped: the builder loads only
+  detected languages and reports exact per-language install commands when a
+  required parser is absent or incompatible.
 - Added a language-neutral adapter contract so source discovery, parsing,
   module identity, dependency resolution, output, and LSP metadata can be
   extended without adding language branches to graph orchestration.
@@ -24,6 +27,8 @@
   source discovery.
 - Prevented unused C# namespace and Java wildcard imports from creating guessed
   dependency edges based only on package cardinality.
+- Prevented unused C#, Java, Go, Rust, or TypeScript grammars from blocking
+  Python-only and other single-language map builds.
 - Rust files, local Cargo modules, workspace crate dependencies, and imported
   Rust entity references are now represented in generated architecture maps.
 

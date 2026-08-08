@@ -83,6 +83,18 @@ class FileResult:
     exported_names: list[str]
 
 
+@dataclass(frozen=True)
+class LanguageDependency:
+    """One exact runtime package required by a language parser."""
+
+    distribution: str
+    version: str
+
+    @property
+    def requirement(self) -> str:
+        return f"{self.distribution}=={self.version}"
+
+
 class BoundLanguage(Protocol):
     """A language implementation bound to one graph-build context."""
 
@@ -117,10 +129,13 @@ class Language(Protocol):
     def lsp_label(self) -> str: ...
 
     @property
+    def display_name(self) -> str: ...
+
+    @property
     def cli_label(self) -> str: ...
 
     @property
-    def dependency_packages(self) -> tuple[str, ...]: ...
+    def dependencies(self) -> tuple[LanguageDependency, ...]: ...
 
     @property
     def source_extensions(self) -> tuple[str, ...]: ...

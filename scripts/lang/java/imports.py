@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from ..interface import FileResult
-from .parser import declared_java_types
 
 
 def _freeze_index(index: dict[str, set[str]]) -> dict[str, tuple[str, ...]]:
@@ -21,6 +20,8 @@ class BoundJavaLanguage:
 
     @classmethod
     def create(cls, path_to_id: Mapping[str, str]) -> BoundJavaLanguage:
+        from .parser import declared_java_types
+
         type_index: dict[str, set[str]] = {}
         for path, node_id in sorted(path_to_id.items()):
             if not path.endswith(".java"):
