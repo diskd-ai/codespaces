@@ -1,241 +1,164 @@
-# Codespaces Skill
+# Codespaces - Code Search, Dependency Graphs, and Impact Analysis
 
 > **Install:** `npx skills add diskd-ai/codespaces` | [skills.sh](https://skills.sh)
 >
 > **Release notes:** [Changelog](CHANGELOG.md)
 
-Query a `.belief_map.sexp` graph to discover module boundaries, dependencies, and blast radius before reading source -- so you read the minimal set of files, never whole directories.
+Understand a large codebase before you change it. Codespaces is an
+architecture-aware code search tool for Python, TypeScript, TSX, and Rust
+repositories. It helps developers and AI coding agents find the right module,
+trace dependencies, measure change impact, and read only the source files that
+matter.
 
----
+Use it for codebase architecture discovery, dependency graph search, blast-radius
+analysis, call-flow tracing, monorepo navigation, and safer AI-assisted coding.
 
-## Scope & Purpose
+## What can Codespaces answer?
 
-This skill bundles a belief-map query engine and graph builders for architecture discovery, covering:
+- Where is authentication, billing, upload, or another feature implemented?
+- Which modules depend on this service, class, function, or type?
+- What could break if I change this file?
+- Which two or three files should I read before fixing a bug?
+- How does a request or data value move through the system?
+- Does this dependency cross an architecture boundary?
+- Can you draw a call-flow, data-flow, or sequence diagram from the code?
 
-* Module boundary and ownership discovery
-* Dependency and reverse-dependency (blast-radius) tracing
-* Architecture-layer and boundary-violation checks
-* Naming-convention (invariant) checks
-* Call-chain and data-flow tracing
-* Cross-language analysis (Python, TypeScript, TSX)
-* Infrastructure topology from Kustomize, Helm, and Terraform
+Instead of searching a repository one text match at a time, Codespaces turns code
+into a queryable map of modules, entities, imports, references, call relationships,
+architecture layers, and infrastructure connections.
 
----
+## Quick start for AI coding agents
 
-## When to Use This Skill
-
-**Triggers:**
-* "How does X call Y?" or "Where is this stored?"
-* "What breaks if I change Z?"
-* Root-cause investigations mentioning services, APIs, jobs, events, or UI flows
-* Architecture reviews, impact analysis, or public-contract changes
-* Before any non-trivial code change (boundary check first)
-
-**Use cases:**
-* Scoping the minimal files to read before implementing a change
-* Blast-radius analysis before a refactor
-* Detecting architecture-layer and naming violations
-* Tracing call chains and data flow across modules
-* Mapping infrastructure topology to source code
-
----
-
-## Quick Reference
-
-### Core Commands
-
-Run from the skill's base directory: `python3 scripts/belief_search.py <command>`
-
-| Command | Purpose |
-|---------|---------|
-| `search "<pattern>"` | Safe literal/`.*` pattern search for module IDs |
-| `analyze <id>` | Full module analysis (PRIMARY command) |
-| `quick <keyword>` | Search + analyze the first match (shortcut) |
-| `boundary <id>` | Files to read for a change |
-| `deps <id> [depth]` | Outgoing dependency tree |
-| `rdeps <id> [depth]` | Blast radius (who depends on this) |
-| `flow <id> <fn>` | Trace call/data flow |
-| `boundaries [id\|all]` | Check architecture violations |
-| `invariants [id\|all]` | Check naming-convention violations |
-| `layers` | Show all modules grouped by layer |
-| `query '<sexp>'` | Composable Scheme query |
-| `repl` | Interactive Scheme REPL |
-
-### Output Notation
-
-All output is S-expression facts, one per line.
-
-| Fact | Meaning |
-|------|---------|
-| `(boundary <mod> :lang :file :purpose)` | Module boundary file |
-| `(boundary-dep <mod> <dep> :relation)` | Outgoing dependency edge |
-| `(boundary-rdep <mod> <rdep> :relation)` | Reverse-dependency edge |
-| `(entity-def cls <mod> <Name> <line>)` | Type/class definition |
-| `(violation <src> <tgt> :src-layer :tgt-layer)` | Architecture violation |
-
-`:lang` values: `py` (Python), `ts` (TypeScript), `tsx` (TSX).
-
----
-
-## Workflow
-
-1. **Locate or build the map**: check for `.belief_map.sexp`; if absent, build it
-   ```bash
-   SKILL_ROOT="$(pwd -P)"
-   TARGET_ROOT="$(cd /absolute/path/to/project && pwd -P)"
-   python3 -m pip install -r "$SKILL_ROOT/requirements.txt"
-   python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT"
-   python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --full
-   ```
-2. **Find the module ID**: `search "keyword"` or `entity EntityName` (IDs are full relative paths, never short codes -- never guess them)
-3. **Analyze**: `analyze <module-id>` returns boundary files, deps, rdeps, layer, and violations
-4. **Read only the boundary files** listed in the analyze output -- not entire directories
-5. **Verify after changes**: re-run `boundaries <id>` to confirm no new violations
-
----
-
-## TypeScript Resolution Contract
-
-The AST pass supports TypeScript and TSX static imports, type-only and
-side-effect imports, named/star/type re-exports, literal `import()`, literal
-`require()`, `import = require()`, literal template imports, emitted
-`.js`/`.jsx` specifiers, project-scoped `paths` aliases, and conventional exact
-package self-imports.
-
-It does not claim full Node/TypeScript resolver parity. Inherited `tsconfig`
-aliases, `baseUrl`-only imports, package `source`/`exports` entrypoints, and
-self-package export subpaths require LSP enrichment or direct source
-verification.
-
-Custom output locations can be queried explicitly:
+Install the skill:
 
 ```bash
-python3 "$SKILL_ROOT/scripts/belief_search.py" \
-  --map /absolute/path/to/map.sexp \
-  --root "$TARGET_ROOT" \
-  analyze module/id
+npx skills add diskd-ai/codespaces
 ```
 
----
+Then ask your agent a natural question:
 
-## Example Agent Prompts
-
-Drive an agent (Claude Code, Codex, ...) with the query-before-code workflow.
-
-**Refactoring task (detailed):**
-```
-Extract the validation logic from OperativesService into a separate module.
-First use the codespaces skill -- do not read source blindly:
-
-1. Find the module: search "operatives.*service"
-2. Run analyze on the found ID -- show boundary, deps, rdeps, layer, violations
-3. Check the blast radius: rdeps <id> 2 -- who breaks if I change this
-4. Read ONLY the boundary files from the analyze output, not the whole directory
-5. Propose a refactoring plan accounting for the blast radius, then change the code
-6. After the change, run boundaries <id> -- confirm there are no new violations
+```text
+Use the Codespaces skill before reading source.
+Find where file uploads are handled, analyze that module, show its dependencies
+and blast radius, then list only the boundary files needed for the change.
 ```
 
-**Quick debugging (daily):**
-```
-Use the codespaces belief map before reading code.
-Task: why does file upload in drive fail?
-Run quick "drive upload", read only the boundary files, find the root cause.
-```
+Codespaces works with Codex, Claude Code, and other clients that support Agent
+Skills.
 
-**Standing instruction (pin in your agent config):**
-```
-Before any non-trivial code change, query the belief map first
-(search -> analyze -> rdeps), read only boundary files, and run
-boundaries after the change.
-```
+## Quick start from the command line
 
----
+Clone the repository and install its pinned parser dependencies:
 
-## Visualize Flows (Diagrams)
-
-The belief map already stores `imports`, `calls`, `data-flow`, and `refs` edges, so an agent can render **code-flow, data-flow, and sequence diagrams straight from facts** -- not guessed from reading source. This is the fastest way to see the skill's power: ask for a diagram and the agent queries the graph, then emits Mermaid (renders natively on GitHub).
-
-**Sequence diagram (from a call chain):**
-```
-Use the codespaces skill to draw a sequence diagram for file upload.
-1. find_callchain handleUpload create 5   # trace the call path
-2. flow drive_api handleUpload            # expand call/data flow
-Render the result as a Mermaid sequenceDiagram, one participant per module.
+```bash
+git clone https://github.com/diskd-ai/codespaces.git
+cd codespaces
+python3 -m pip install -r requirements.txt
 ```
 
-**Code-flow / call graph (flowchart):**
-```
-Use the codespaces skill to draw the call flow around OperativesService.
-Run: analyze operatives.service ; deps operatives.service 2
-Render a Mermaid flowchart LR -- one node per module, edges = imports/calls.
-```
+Build an architecture map for an explicit project directory:
 
-**Data-flow diagram:**
-```
-Use the codespaces skill to draw the data flow for DrivePath.
-Query: rg 'data-flow' .belief_map.sexp ; then refs-to "DrivePath"
-Render a Mermaid flowchart showing where data is produced -> validated -> consumed.
+```bash
+python3 scripts/build_belief_map.py --root /absolute/path/to/project
 ```
 
-Tip: add `--lsp` to the explicit-root build command for precise call-site edges -- sequence diagrams come out much sharper.
+Run a relevant search and get the first matching module with its full context:
 
----
-
-## Skill Structure
-
-```
-codespaces/
-  SKILL.md                    # Skill definition and mandatory workflow
-  README.md                   # This file (overview)
-  LOG.md                      # Goal-completion change log
-  scripts/                    # Bundled Python tools
-    belief_search.py            # Query the belief-map graph
-    build_belief_map.py         # Generate the belief map from source
-    build_infra_topology.py     # Extract Kustomize/Helm/Terraform topology
-    git_descendants.py          # Find commits descending from a ref
-  references/                 # Supporting documentation
-    sexp-notation.md            # S-expression fact format
-    scheme-queries.md           # Scheme query language reference
-  tests/
-    test_belief_search.py
+```bash
+python3 scripts/belief_search.py \
+  --map /absolute/path/to/project/.belief_map.sexp \
+  --root /absolute/path/to/project \
+  quick "file upload"
 ```
 
----
+The map is written to `.belief_map.sexp`. Codespaces does not modify the source
+files it analyzes.
 
-## Usage Guidelines
+## Common code searches
 
-* **Query before you read.** Run a belief-map query before `rg`, `find`, `cat`, or opening directories -- the skill only helps as the first scoping step.
-* **Never guess module IDs.** They are full relative paths (e.g. `pki-service/src/modules/ca/ca.service`); always `search` first.
-* **`analyze` is primary.** Run it immediately after finding the ID -- it returns the full change context in one step.
-* **Read boundary files only.** When the boundary shows 2-3 files, read only those; ignore the rest of the directory.
-* **Use the bundled scripts.** Never use project-local copies -- they may be outdated and emit JSON instead of sexp.
-* **Rebuild after structural changes** (added/removed files, changed imports, new classes).
+| Goal | Command |
+|---|---|
+| Find and analyze a feature | `quick "payments"` |
+| Search for a module | `search "payment.*service"` |
+| See full module context | `analyze path/to/module` |
+| Find files needed for a change | `boundary path/to/module --files-only` |
+| Trace dependencies | `deps path/to/module 2` |
+| Measure blast radius | `rdeps path/to/module 2` |
+| Find a class, interface, enum, or type | `find_type OrderService` |
+| Find a function or method | `find_function createOrder` |
+| Find callers | `find_callers createOrder 2` |
+| Trace a call path | `find_callchain handleRequest createOrder 5` |
+| Search inside function bodies | `grep_functions "validate.*input"` |
+| Check architecture boundaries | `boundaries all` |
+| Check naming conventions | `invariants all` |
+| Inspect changed functions | `diff_functions HEAD~1` |
 
----
+Pass the same `--map` and `--root` options shown in the quick start when the map
+is outside the current directory.
 
-## Best Practices
+## Supported languages and projects
 
-### Finding Modules
-* Use `search` with literal text or a broad `.*` pattern first, then narrow with the returned full path. Patterns support literals, `.*`, boundary `^`/`$` anchors, and backslash escapes; other regex operators are rejected.
-* On `(error no-match ...)`, do not retry the same ID -- broaden the search and use the `:suggestions` field if present.
+| Language | What is indexed |
+|---|---|
+| Python | Modules, imports, classes, functions, methods, inheritance, and references |
+| TypeScript and TSX | Imports, re-exports, classes, interfaces, functions, types, decorators, aliases, and references |
+| Rust | Cargo crates, modules, `use` dependencies, structs, traits, enums, functions, implementations, and methods |
 
-### Analyzing Impact
-* Use `rdeps <id>` to size the blast radius before a refactor.
-* Use `boundaries <id>` and `layers` to confirm a change respects architecture layers.
+Codespaces is designed for single repositories and monorepos. It understands
+Python project roots, TypeScript configuration and package aliases, Cargo package
+names, and local Rust crate dependencies.
 
-### Composing Queries
-* Build an analysis plan from Scheme primitives (`boundary`, `deps`, `rdeps`, `intersect`, `filter`, `files`, `count`) before touching code.
-* Re-run `violations <id>` after changes to verify the boundary still holds.
+It can also map infrastructure relationships from Kustomize, Helm, and Terraform.
 
----
+## A simple workflow
 
-## Resources
+1. Build the map for the exact repository you want to understand.
+2. Search for a feature, type, function, or module instead of guessing a path.
+3. Analyze the returned module to see dependencies, reverse dependencies, layers,
+   references, and the minimal boundary files.
+4. Read only those files and make the change.
+5. Rebuild the map after structural changes and check boundaries again.
 
-* **Skill definition**: [SKILL.md](SKILL.md)
-* **S-expression notation**: [references/sexp-notation.md](references/sexp-notation.md)
-* **Scheme query language**: [references/scheme-queries.md](references/scheme-queries.md)
+This keeps code exploration focused and gives AI coding agents less irrelevant
+context, clearer ownership, and better evidence for implementation decisions.
 
----
+## Call graphs and diagrams
+
+The default static analysis builds import, reference, data-flow, and architecture
+edges. Add `--lsp` when supported language servers are installed to enrich the map
+with precise call-site information:
+
+```bash
+python3 scripts/build_belief_map.py \
+  --root /absolute/path/to/project \
+  --lsp
+```
+
+You can then ask an agent to render Mermaid diagrams from the graph:
+
+```text
+Use Codespaces to trace the file upload flow and render a Mermaid sequence diagram.
+Base every participant and edge on the belief-map facts.
+```
+
+## Accuracy and limits
+
+Codespaces is an architecture and impact-analysis tool, not a compiler replacement.
+The default map comes from deterministic static parsing. Optional LSP enrichment
+adds call hierarchy and reference detail when the relevant language server is
+available.
+
+For generated imports, runtime dependency injection, reflection, or framework
+behavior that is not explicit in source, verify the result against the running
+application or the owning framework.
+
+## Project resources
+
+- [Skill workflow and complete command reference](SKILL.md)
+- [S-expression map format](references/sexp-notation.md)
+- [Composable query language](references/scheme-queries.md)
+- [Changelog](CHANGELOG.md)
+- [Completion log](LOG.md)
 
 ## License
 

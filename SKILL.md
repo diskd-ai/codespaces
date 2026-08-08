@@ -1,9 +1,10 @@
 ---
 name: codespaces
 description: >
-  Query `.belief_map.sexp` before non-trivial code changes to find module boundaries,
-  dependencies, blast radius, and the minimal files to read. Use for architecture
-  discovery, impact analysis, and boundary checks.
+  Build and query architecture-aware code search, dependency graphs, call flows,
+  impact analysis, and belief maps for Python, TypeScript, TSX, and Rust repositories.
+  Use before non-trivial code changes to find module boundaries, blast radius,
+  architecture violations, and the minimal source files to read.
 ---
 
 # Codespaces -- Belief Map Architecture Discovery
@@ -137,7 +138,7 @@ Key patterns:
 (result-count 42)
 ```
 
-**`:lang` values**: `py` = Python (snake_case), `ts` = TypeScript (camelCase), `tsx` = TSX (PascalCase).
+**`:lang` values**: `py` = Python (snake_case), `ts` = TypeScript (camelCase), `tsx` = TSX (PascalCase), `rs` = Rust (snake_case).
 
 ## Scheme Query Language
 

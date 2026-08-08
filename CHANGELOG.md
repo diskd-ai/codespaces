@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-08-08
+
+### Changes
+
+- Added a language-neutral adapter contract so source discovery, parsing,
+  module identity, dependency resolution, output, and LSP metadata can be
+  extended without adding language branches to graph orchestration.
+- Added Rust source discovery, Tree-sitter entity extraction, Cargo workspace
+  import resolution, and rust-analyzer metadata.
+- Reworked the README around natural code-search questions, a shorter quick
+  start, supported languages, common impact-analysis workflows, and honest
+  accuracy limits.
+- Expanded the skill and repository descriptions with architecture-aware code
+  search, dependency graph, Rust, monorepo, and AI coding-agent discovery terms.
+
+### Fixes
+
+- Rust files, local Cargo modules, workspace crate dependencies, and imported
+  Rust entity references are now represented in generated architecture maps.
+
 ## 2026-07-30
 
 ### Changes

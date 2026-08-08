@@ -1,0 +1,54 @@
+from __future__ import annotations
+
+from .interface import BoundLanguage, Entity, FileResult, ImportedName, Language
+from .python import PYTHON_LANGUAGE
+from .rust import RUST_LANGUAGE
+from .typescript import TYPESCRIPT_LANGUAGE
+
+
+class UnsupportedLanguageError(ValueError):
+    """Raised when graph orchestration has no owner for a language value."""
+
+
+LANGUAGES: tuple[Language, ...] = (
+    PYTHON_LANGUAGE,
+    TYPESCRIPT_LANGUAGE,
+    RUST_LANGUAGE,
+)
+
+
+def language_for_file(file_name: str) -> Language | None:
+    for language in LANGUAGES:
+        if language.accepts_file(file_name):
+            return language
+    return None
+
+
+def language_for_name(name: str) -> Language:
+    for language in LANGUAGES:
+        if language.name == name:
+            return language
+    raise UnsupportedLanguageError(f"Unsupported source language: {name}")
+
+
+def language_for_result(result_language: str) -> Language:
+    for language in LANGUAGES:
+        if result_language in language.result_languages:
+            return language
+    raise UnsupportedLanguageError(
+        f"Unsupported parsed result language: {result_language}"
+    )
+
+
+__all__ = [
+    "BoundLanguage",
+    "Entity",
+    "FileResult",
+    "ImportedName",
+    "LANGUAGES",
+    "Language",
+    "UnsupportedLanguageError",
+    "language_for_file",
+    "language_for_name",
+    "language_for_result",
+]

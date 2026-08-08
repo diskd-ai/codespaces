@@ -1,3 +1,39 @@
+# Completion Log
+
+## 2026-08-08
+
+### Changes
+- Added a language-neutral `Language` protocol and registry for source
+  ownership, parsing, import resolution, module IDs, output codes, and LSP
+  configuration.
+- Moved Python parsing and import resolution to `scripts/lang/python` and
+  TypeScript/TSX parsing and import resolution to `scripts/lang/typescript`.
+- Added a Rust adapter under `scripts/lang/rust` with Tree-sitter entity
+  extraction, trait and inherent implementation methods, Cargo workspace
+  resolution, and rust-analyzer metadata.
+- Added focused registry, script-mode CLI, Rust parser, and Cargo dependency
+  tests while retaining the hardened builder and TypeScript recall coverage.
+- Rewrote the README and public descriptions around user questions, quick code
+  search, dependency graphs, blast-radius analysis, supported languages, and
+  AI-agent workflows.
+
+### Fixes
+- Parser dispatch now surfaces unsupported languages and parse failures instead
+  of silently dropping failed files.
+- Preserved the hardened explicit-root, collision, cache-provenance, atomic
+  publication, locking, and safe-query contracts while extracting languages.
+- Compared the extracted Python and TypeScript adapters with the upstream
+  pre-extraction builder on the current Upgraide mono checkout: all 7,215 files,
+  7,215 nodes, and 55,972 edges produced identical facts and graph hashes.
+- Verified Rust support against `diskd-cli`: all 4 tracked Rust files were
+  discovered, all 256 source-oracle entities matched, and both local crate
+  dependency edges matched, with 100% precision and recall.
+
+### Motivation
+- Make new source-language support additive at one explicit boundary, prove
+  Rust coverage on a real Cargo workspace, and make the project easier to find
+  and use without weakening existing graph correctness guarantees.
+
 ## 2026-07-30
 
 ### Changes

@@ -357,9 +357,15 @@ class IssueOneRegressionTest(unittest.TestCase):
 
     def test_missing_parser_dependency_has_install_diagnostic(self) -> None:
         """/* REQ-CS-032: missing parser dependencies must fail without a traceback. */"""
+        clean_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "PYTHONPATH"
+        }
         result = subprocess.run(
             [sys.executable, "-S", str(BUILD_SCRIPT)],
             capture_output=True,
+            env=clean_environment,
             text=True,
         )
 

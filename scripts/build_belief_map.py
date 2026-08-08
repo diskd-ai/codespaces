@@ -14,16 +14,19 @@ Parsers
 - **TypeScript/TSX**: tree-sitter (``tree-sitter-typescript``). Handles
   decorators, heritage, all methods, object literals, arrow functions.
 - **Python**: stdlib ``ast``. Full class/function/import extraction.
+- **Rust**: tree-sitter (``tree-sitter-rust``). Handles Cargo crates,
+  declarations, implementations, methods, and ``use``/``mod`` dependencies.
 
 Modes
 -----
 **Default** (fast, ~5-8s for full workspace):
-    Parses all .py/.ts/.tsx files, builds import/reference/data-flow edges.
+    Parses all .py/.ts/.tsx/.rs files, builds import/reference/data-flow edges.
 
 **LSP-enhanced** (``--lsp``, ~1-5min):
     After default pass, starts ``typescript-language-server`` and
-    ``pyright-langserver`` per project to query call hierarchy and
-    references. Adds precise ``calls`` edges and ``:lsp`` annotations.
+    ``pyright-langserver`` or ``rust-analyzer`` per project to query call
+    hierarchy and references. Adds precise ``calls`` edges and ``:lsp``
+    annotations.
 
 Edge Types
 ----------
@@ -51,7 +54,8 @@ Requirements
 
     python3 -m pip install -r requirements.txt
 
-Optional for ``--lsp``: ``typescript-language-server``, ``pyright-langserver``.
+Optional for ``--lsp``: ``typescript-language-server``, ``pyright-langserver``,
+``rust-analyzer``.
 
 Usage
 -----
@@ -67,7 +71,6 @@ Usage
 
 from __future__ import annotations
 
-import ast
 import fcntl
 import hashlib
 import importlib.metadata
@@ -83,12 +86,35 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generic, Optional, TypeVar
+from typing import Any, Generic, Optional, Sequence, TypeVar
 from urllib.parse import quote, unquote
 
 try:
-    import tree_sitter_typescript as _tst
-    from tree_sitter import Language as _TsLanguage, Parser as _TsParser
+    if __package__:
+        from .lang import (
+            LANGUAGES,
+            BoundLanguage,
+            FileResult,
+            language_for_file,
+            language_for_name,
+            language_for_result,
+        )
+        from .lang.purpose import infer_purpose
+        from .lang.interface import EntityPayload
+        from .lang.source import file_hash
+    else:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from lang import (
+            LANGUAGES,
+            BoundLanguage,
+            FileResult,
+            language_for_file,
+            language_for_name,
+            language_for_result,
+        )
+        from lang.purpose import infer_purpose
+        from lang.interface import EntityPayload
+        from lang.source import file_hash
 except ModuleNotFoundError as dependency_error:
     print(
         f"Error: missing Python dependency {dependency_error.name}. "
@@ -97,9 +123,6 @@ except ModuleNotFoundError as dependency_error:
         file=sys.stderr,
     )
     raise SystemExit(2) from None
-
-_TS_LANG = _TsLanguage(_tst.language_typescript())
-_TSX_LANG = _TsLanguage(_tst.language_tsx())
 
 # ---------------------------------------------------------------------------
 # Config
@@ -116,24 +139,12 @@ CACHE_FILE = ".belief_map_cache.json"
 OUTPUT_FILE = ".belief_map.sexp"
 CACHE_SCHEMA_VERSION = 1
 MAP_SCHEMA_VERSION = 1
-BUILDER_CONFIG_VERSION = "2026-07-30"
+BUILDER_CONFIG_VERSION = "2026-08-08"
 
 # Default timeout for LSP requests (seconds)
 LSP_REQUEST_TIMEOUT = 15.0
 # Timeout for LSP server initialization (seconds)
 LSP_INIT_TIMEOUT = 60.0
-
-# -- Python regex patterns --
-
-PY_ABC_RE = re.compile(r"""class\s+\w+\s*\(.*(?:ABC|ABCMeta|Protocol).*\)""")
-PY_INHERITS_RE = re.compile(r"""class\s+(\w+)\s*\(([^)]+)\)""")
-
-# Naming convention detectors
-SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-CAMEL_CASE_RE = re.compile(r"^[a-z][a-zA-Z0-9]*$")
-PASCAL_CASE_RE = re.compile(r"^[A-Z][a-zA-Z0-9]*$")
-KEBAB_CASE_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -154,60 +165,6 @@ class Err(Generic[E]):
 
 
 Result = Ok[T] | Err[E]
-
-
-@dataclass
-class Entity:
-    name: str
-    kind: str  # class, function, interface, type, enum, method, decorator
-    line: int
-    methods: list[str]  # method names (for classes)
-    decorators: list[str]  # decorator names
-    bases: list[str]  # parent classes / implemented interfaces
-
-    def to_dict(self) -> dict:
-        d: dict = {"name": self.name, "kind": self.kind, "line": self.line}
-        if self.methods:
-            d["methods"] = self.methods
-        if self.decorators:
-            d["decorators"] = self.decorators
-        if self.bases:
-            d["bases"] = self.bases
-        return d
-
-
-@dataclass
-class ImportedName:
-    """A single name imported from another module."""
-    local_name: str      # name used locally
-    original_name: str   # name in source module ("default" for default imports)
-    module: str          # raw import specifier
-
-    def to_dict(self) -> dict:
-        return {
-            "local": self.local_name,
-            "original": self.original_name,
-            "module": self.module,
-        }
-
-
-@dataclass
-class FileResult:
-    path: str
-    language: str
-    repo: str
-    mtime: float
-    content_hash: str
-    imports: list[str]
-    exports_abstract: list[str]
-    implements: list[str]
-    extends: list[str]
-    purpose: str
-    naming_convention: str
-    has_validation: bool
-    entities: list[dict]          # Entity.to_dict() results
-    imported_names: list[dict]    # ImportedName.to_dict() results
-    exported_names: list[str]     # names exported from this file
 
 
 @dataclass(frozen=True)
@@ -240,552 +197,14 @@ class LspEdge:
 class ProjectGroup:
     """A group of files belonging to the same LSP project."""
     root: str              # absolute path to project root
-    language: str          # "typescript" or "python"
-    config_file: str       # path to tsconfig.json or pyrightconfig.json
+    language: str          # language adapter name
+    config_file: str       # language-owned project configuration
     files: list[FileResult] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class TsPathAlias:
-    """One validated TypeScript path mapping owned by a tsconfig."""
-
-    pattern: str
-    target_patterns: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class TsPathAliasContext:
-    """Path mappings whose scope starts at a tsconfig directory."""
-
-    config_directory: str
-    aliases: tuple[TsPathAlias, ...]
-
-
-@dataclass(frozen=True)
-class TsPackage:
-    """A local TypeScript package identified by its package.json contract."""
-
-    name: str
-    directory: str
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def file_hash(path: str) -> str:
-    """Hash the complete file so restored mtimes cannot hide content changes."""
-    digest = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            while chunk := f.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
-    except OSError as exc:
-        print(f"[belief-map] ERROR: could not hash {path}: {exc}", file=sys.stderr)
-        return ""
-
-
-def detect_naming(filename: str) -> str:
-    stem = Path(filename).stem
-    for suffix in (".test", ".spec", ".e2e", ".stories", ".d"):
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
-    if SNAKE_CASE_RE.match(stem):
-        return "snake_case"
-    if KEBAB_CASE_RE.match(stem):
-        return "kebab-case"
-    if PASCAL_CASE_RE.match(stem):
-        return "PascalCase"
-    if CAMEL_CASE_RE.match(stem):
-        return "camelCase"
-    return "mixed"
-
-
-def _levenshtein(a: str, b: str) -> int:
-    """Compute Levenshtein edit distance between two strings."""
-    if len(a) < len(b):
-        return _levenshtein(b, a)
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
-        curr = [i + 1]
-        for j, cb in enumerate(b):
-            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
-        prev = curr
-    return prev[-1]
-
-
-def _fuzzy_suffix_match(name: str, suffix: str, max_dist: int = 1) -> bool:
-    """Check if the tail of `name` fuzzy-matches `suffix` within edit distance."""
-    if len(suffix) < 6:
-        return False  # too short for fuzzy -- "Store"/"Storey" false positives
-    tail = name[-len(suffix) - max_dist:]  # grab suffix + slack for insertions
-    return _levenshtein(tail.lower(), suffix.lower()) <= max_dist
-
-
-def infer_purpose(path: str, content: str, language: str, entities: Optional[list] = None) -> str:
-    """Infer architectural purpose from path, content, and entity names."""
-    parts = []
-    rel = path.lower()
-
-    # Path-based heuristics
-    if "/domain/" in rel:
-        parts.append("domain logic")
-    elif "/infrastructure/" in rel or "/infra/" in rel:
-        parts.append("infrastructure adapter")
-    elif "/api/" in rel:
-        parts.append("API layer")
-    elif "/app/" in rel or "/application/" in rel:
-        parts.append("application service")
-    elif "/components/" in rel or "/ui/" in rel:
-        parts.append("UI component")
-    elif "/hooks/" in rel:
-        parts.append("React hook")
-    elif "/pages/" in rel or "/routes/" in rel:
-        parts.append("page/route")
-    elif "/migrations/" in rel:
-        parts.append("database migration")
-    elif "/test" in rel or ".test." in rel or ".spec." in rel:
-        parts.append("test")
-    elif "/config" in rel:
-        parts.append("configuration")
-    elif "/utils/" in rel or "/helpers/" in rel or "/commons/" in rel:
-        parts.append("shared utilities")
-    elif "/repositories/" in rel or "/repo/" in rel:
-        parts.append("repository")
-    elif "/services/" in rel:
-        parts.append("service")
-    elif "/dto/" in rel:
-        parts.append("DTO")
-    elif "/guards/" in rel or "guard" in rel:
-        parts.append("access guard")
-    elif "/store/" in rel or "/stores/" in rel:
-        parts.append("state store")
-    elif "/schema" in rel:
-        parts.append("schema")
-    elif "/sdk/" in rel:
-        parts.append("SDK")
-    elif "/api-client/" in rel or "/api_client/" in rel:
-        parts.append("API client")
-
-    # Docstring extraction
-    head = content[:2048]
-    if language == "python":
-        match = re.search(r'^"""(.*?)"""', head, re.DOTALL)
-        if not match:
-            match = re.search(r"^'''(.*?)'''", head, re.DOTALL)
-        if match:
-            parts.append(match.group(1).strip().split("\n")[0][:120])
-    else:
-        match = re.search(r"/\*\*\s*\n?\s*\*?\s*(.+?)(?:\n|\*/)", head)
-        if match:
-            parts.append(match.group(1).strip()[:120])
-
-    # Entity-name heuristics (Gap 3 fix: reduces "general module" fallback)
-    # -- Suffix -> (purpose label, dedup keyword) --
-    _ENTITY_SUFFIX_MAP = [
-        # Core architecture roles
-        ("Service", "service", "service"),
-        ("Controller", "API controller", "controller"),
-        ("Repository", "repository", "repository"),
-        ("Repo", "repository", "repository"),
-        ("Gateway", "gateway", "gateway"),
-        ("Registry", "registry", "registry"),
-        ("Store", "state store", "store"),
-        ("Guard", "access guard", "guard"),
-        ("Module", "module", "module"),
-        ("Adapter", "adapter", "adapter"),
-        ("Provider", "provider", "provider"),
-        ("Processor", "processor", "processor"),
-        ("Agent", "agent", "agent"),
-        ("Resolver", "resolver", "resolver"),
-        ("Scheduler", "scheduler", "scheduler"),
-        ("Worker", "worker", "worker"),
-        ("Client", "client", "client"),
-        ("Connector", "connector", "connector"),
-        ("Manager", "manager", "manager"),
-        ("Subscriber", "subscriber", "subscriber"),
-        ("Dispatcher", "dispatcher", "dispatcher"),
-        ("Emitter", "emitter", "emitter"),
-        ("Interceptor", "interceptor", "interceptor"),
-        ("Pipe", "validation pipe", "pipe"),
-        ("Handler", "handler", "handler"),
-        ("Listener", "event listener", "listener"),
-        # GoF patterns
-        ("Factory", "Factory pattern", "factory"),
-        ("Builder", "Builder pattern", "builder"),
-        ("Singleton", "Singleton pattern", "singleton"),
-        ("Observer", "Observer pattern", "observer"),
-        ("Strategy", "Strategy pattern", "strategy"),
-        ("Command", "Command pattern", "command"),
-        ("Mediator", "Mediator pattern", "mediator"),
-        ("Visitor", "Visitor pattern", "visitor"),
-        ("Decorator", "Decorator pattern", "decorator"),
-        ("Proxy", "Proxy pattern", "proxy"),
-        ("Facade", "Facade pattern", "facade"),
-        ("Composite", "Composite pattern", "composite"),
-        ("Iterator", "Iterator pattern", "iterator"),
-        ("ChainHandler", "Chain of Responsibility", "chain"),
-        # Fowler / DDD patterns
-        ("Specification", "Specification pattern", "specification"),
-        ("Spec", "Specification pattern", "specification"),
-        ("ValueObject", "value object", "value"),
-        ("Aggregate", "aggregate root", "aggregate"),
-        ("UnitOfWork", "Unit of Work", "unitofwork"),
-        ("DomainEvent", "domain event", "domainevent"),
-        ("IdentityMap", "Identity Map", "identitymap"),
-        ("Policy", "policy", "policy"),
-        ("Plugin", "plugin", "plugin"),
-        # SDK / API
-        ("Sdk", "SDK", "sdk"),
-        ("SDK", "SDK", "sdk"),
-        ("Api", "API client", "api client"),
-        ("API", "API client", "api client"),
-    ]
-
-    if entities:
-        joined_lower = " ".join(parts).lower()
-        for ent in entities:
-            ename = ent.get("name", "") if isinstance(ent, dict) else ent.name
-            ekind = ent.get("kind", "") if isinstance(ent, dict) else ent.kind
-            if ekind not in ("class", "interface"):
-                continue
-            # Exact suffix match first
-            matched = False
-            for suffix, purpose_label, dedup_kw in _ENTITY_SUFFIX_MAP:
-                if ename.endswith(suffix):
-                    if dedup_kw not in joined_lower:
-                        parts.append(purpose_label)
-                        joined_lower = " ".join(parts).lower()
-                    matched = True
-                    break
-            # Fuzzy suffix fallback (distance <= 1, suffixes >= 4 chars)
-            if not matched and len(ename) >= 5:
-                for suffix, purpose_label, dedup_kw in _ENTITY_SUFFIX_MAP:
-                    if _fuzzy_suffix_match(ename, suffix):
-                        if dedup_kw not in joined_lower:
-                            parts.append(purpose_label)
-                            joined_lower = " ".join(parts).lower()
-                        break
-
-    # Pattern detection -- only flag patterns when the file DEFINES one,
-    # not when it merely imports from a module named factory/strategy.
-    joined_check = " ".join(parts).lower()
-
-    # GoF Creational
-    if "factory" not in joined_check:
-        if re.search(r"class \w*Factory|def (?:create|make|build)_\w+.*->|def get_\w+.*factory", head):
-            parts.append("Factory pattern")
-    if "strategy" not in joined_check:
-        if re.search(r"class \w*Strategy|strategy_map|STRATEGIES", head):
-            parts.append("Strategy pattern")
-    if "builder" not in joined_check:
-        if re.search(r"class \w+Builder\b", head):
-            parts.append("Builder pattern")
-    if "singleton" not in joined_check:
-        if re.search(r"getInstance\s*\(|_instance\s*[:=]|private\s+static\s+instance", head):
-            parts.append("Singleton pattern")
-
-    # GoF Structural
-    if "composite" not in joined_check:
-        if re.search(r"class \w+Composite\b|addChild\s*\(|getChildren\s*\(", head):
-            parts.append("Composite pattern")
-    if "proxy" not in joined_check:
-        if re.search(r"class \w+Proxy\b", head):
-            parts.append("Proxy pattern")
-    if "facade" not in joined_check:
-        if re.search(r"class \w+Facade\b", head):
-            parts.append("Facade pattern")
-
-    # GoF Behavioral
-    if "observer" not in joined_check:
-        if re.search(r"class \w+Observer\b|\.subscribe\s*\(|EventEmitter", head):
-            parts.append("Observer pattern")
-    if "command" not in joined_check:
-        if re.search(r"class \w+Command\b", head):
-            parts.append("Command pattern")
-    if "mediator" not in joined_check:
-        if re.search(r"class \w+Mediator\b", head):
-            parts.append("Mediator pattern")
-    if "visitor" not in joined_check:
-        if re.search(r"class \w+Visitor\b|\.accept\s*\(\s*visitor", head):
-            parts.append("Visitor pattern")
-    if "chain" not in joined_check:
-        if re.search(r"class \w+Chain\w*\b|setNext\s*\(|handleNext\s*\(", head):
-            parts.append("Chain of Responsibility")
-    if "memento" not in joined_check:
-        if re.search(r"class \w+Memento\b", head):
-            parts.append("Memento pattern")
-
-    # Fowler / DDD patterns
-    if "specification" not in joined_check:
-        if re.search(r"class \w+Specification\b|isSatisfiedBy\s*\(", head):
-            parts.append("Specification pattern")
-    if "aggregate" not in joined_check:
-        if re.search(r"class \w+Aggregate\b", head):
-            parts.append("aggregate root")
-    if "unitofwork" not in joined_check.replace(" ", ""):
-        if re.search(r"class \w+UnitOfWork\b", head):
-            parts.append("Unit of Work")
-    if "domainevent" not in joined_check.replace(" ", ""):
-        if re.search(r"class \w+DomainEvent\b|class \w+Event\b(?!Emitter|Handler|Listener)", head):
-            parts.append("domain event")
-    if "identitymap" not in joined_check.replace(" ", ""):
-        if re.search(r"class \w+IdentityMap\b", head):
-            parts.append("Identity Map")
-    if "value object" not in joined_check:
-        if re.search(r"class \w+ValueObject\b", head):
-            parts.append("value object")
-
-    # NestJS decorators -- only label when entity-name heuristics didn't
-    # provide a more specific purpose (controller, service, gateway, etc.)
-    _specific_kws = {"controller", "service", "repository", "guard", "gateway",
-                     "adapter", "provider", "processor", "registry", "agent",
-                     "resolver", "scheduler", "worker", "store", "handler",
-                     "interceptor", "pipe", "listener", "subscriber",
-                     "dispatcher", "emitter", "factory", "builder", "observer",
-                     "strategy", "command", "mediator", "visitor", "proxy",
-                     "facade", "composite", "specification", "aggregate",
-                     "policy", "plugin", "manager", "client", "connector",
-                     "sdk", "api client"}
-    joined_after = " ".join(parts).lower()
-    has_specific = any(kw in joined_after for kw in _specific_kws)
-    if not has_specific:
-        if re.search(r"@Controller\b", head):
-            parts.append("API controller")
-        elif re.search(r"@Module\b", head):
-            parts.append("NestJS wiring module")
-        elif re.search(r"@Injectable\b", head):
-            parts.append("NestJS injectable")
-
-    if re.search(r"Router|router\s*\(|createRouter", head):
-        if "router" not in " ".join(parts).lower():
-            parts.append("router")
-    if re.search(r"middleware|Middleware", head):
-        if "middleware" not in " ".join(parts).lower():
-            parts.append("middleware")
-
-    # --- File-stem based heuristics ---
-    stem = Path(path).stem.lower()
-    for sfx in (".test", ".spec", ".e2e", ".stories", ".d"):
-        if stem.endswith(sfx):
-            stem = stem[: -len(sfx)]
-
-    if not parts:
-        if stem.endswith("dto") or stem.endswith("dtos"):
-            parts.append("data transfer object")
-        elif stem.endswith("mapper") or stem.endswith("mappers"):
-            parts.append("data mapper")
-        elif stem.endswith("helpers") or stem.endswith("helper") or stem.endswith("utils") or stem.endswith("util"):
-            parts.append("utility helpers")
-        elif stem.endswith("constants") or stem.endswith("const"):
-            parts.append("constants")
-        elif stem.endswith("types") or stem.endswith("type"):
-            parts.append("type definitions")
-        elif stem.endswith("interfaces") or stem.endswith("interface"):
-            parts.append("interface definitions")
-        elif stem.endswith("enums") or stem.endswith("enum"):
-            parts.append("enum definitions")
-        elif stem.endswith("models") or stem.endswith("model"):
-            parts.append("data model")
-        elif stem.endswith("entities") or stem.endswith("entity"):
-            parts.append("domain entity")
-        elif stem.endswith("errors") or stem.endswith("error") or stem.endswith("exceptions") or stem.endswith("exception"):
-            parts.append("error definitions")
-        elif stem.endswith("factories") or stem.endswith("factory"):
-            parts.append("factory")
-        elif stem.endswith("validators") or stem.endswith("validator"):
-            parts.append("validation")
-        elif stem.endswith("handlers") or stem.endswith("handler"):
-            parts.append("event handler")
-        elif stem.endswith("listeners") or stem.endswith("listener"):
-            parts.append("event listener")
-        elif stem.endswith("middleware"):
-            parts.append("middleware")
-        elif stem.endswith("interceptor"):
-            parts.append("interceptor")
-        elif stem.endswith("guard"):
-            parts.append("access guard")
-        elif stem.endswith("pipe"):
-            parts.append("validation pipe")
-        elif stem.endswith("decorators") or stem.endswith("decorator"):
-            parts.append("decorator")
-        elif stem.endswith("migration"):
-            parts.append("database migration")
-        elif stem.endswith("seed") or stem.endswith("seeder"):
-            parts.append("database seed")
-        elif stem.endswith("fixtures") or stem.endswith("fixture"):
-            parts.append("test fixture")
-        elif stem.endswith("mocks") or stem.endswith("mock"):
-            parts.append("test mock")
-        # Core architecture roles (stem-based)
-        elif stem.endswith("controller") or stem.endswith("controllers"):
-            parts.append("API controller")
-        elif stem.endswith("service") or stem.endswith("services"):
-            parts.append("service")
-        elif stem.endswith("repository") or stem.endswith("repositories"):
-            parts.append("repository")
-        elif stem.endswith("gateway") or stem.endswith("gateways"):
-            parts.append("gateway")
-        elif stem.endswith("registry") or stem.endswith("registries"):
-            parts.append("registry")
-        elif stem.endswith("agent") or stem.endswith("agents"):
-            parts.append("agent")
-        elif stem.endswith("store") or stem.endswith("stores"):
-            parts.append("state store")
-        elif stem.endswith("policy") or stem.endswith("policies"):
-            parts.append("policy")
-        elif stem.endswith("resolver") or stem.endswith("resolvers"):
-            parts.append("resolver")
-        elif stem.endswith("scheduler") or stem.endswith("schedulers"):
-            parts.append("scheduler")
-        elif stem.endswith("worker") or stem.endswith("workers"):
-            parts.append("worker")
-        elif stem.endswith("client") or stem.endswith("clients"):
-            parts.append("client")
-        elif stem.endswith("connector") or stem.endswith("connectors"):
-            parts.append("connector")
-        elif stem.endswith("manager") or stem.endswith("managers"):
-            parts.append("manager")
-        elif stem.endswith("subscriber") or stem.endswith("subscribers"):
-            parts.append("subscriber")
-        elif stem.endswith("dispatcher") or stem.endswith("dispatchers"):
-            parts.append("dispatcher")
-        elif stem.endswith("emitter") or stem.endswith("emitters"):
-            parts.append("emitter")
-        elif stem.endswith("adapter") or stem.endswith("adapters"):
-            parts.append("adapter")
-        elif stem.endswith("provider") or stem.endswith("providers"):
-            parts.append("provider")
-        elif stem.endswith("processor") or stem.endswith("processors"):
-            parts.append("processor")
-        # GoF pattern stems
-        elif stem.endswith("observer"):
-            parts.append("Observer pattern")
-        elif stem.endswith("builder"):
-            parts.append("Builder pattern")
-        elif stem.endswith("visitor"):
-            parts.append("Visitor pattern")
-        elif stem.endswith("mediator"):
-            parts.append("Mediator pattern")
-        elif stem.endswith("facade"):
-            parts.append("Facade pattern")
-        elif stem.endswith("proxy"):
-            parts.append("Proxy pattern")
-        elif stem.endswith("strategy") or stem.endswith("strategies"):
-            parts.append("Strategy pattern")
-        elif stem.endswith("command") or stem.endswith("commands"):
-            parts.append("Command pattern")
-        elif stem.endswith("singleton"):
-            parts.append("Singleton pattern")
-        elif stem.endswith("composite"):
-            parts.append("Composite pattern")
-        # Fowler / DDD pattern stems
-        elif stem.endswith("aggregate") or stem.endswith("aggregates"):
-            parts.append("aggregate root")
-        elif stem.endswith("specification") or stem.endswith("specifications"):
-            parts.append("Specification pattern")
-        elif stem.endswith("plugin") or stem.endswith("plugins"):
-            parts.append("plugin")
-        elif stem.endswith("sdk"):
-            parts.append("SDK")
-        elif stem.endswith("api"):
-            parts.append("API client")
-        elif stem in ("index", "__init__"):
-            parts.append("module entry point")
-        elif stem in ("main", "app"):
-            parts.append("application entry point")
-        elif stem in ("setup", "bootstrap"):
-            parts.append("application bootstrap")
-
-    # --- Fuzzy stem fallback (distance <= 1, stems >= 4 chars) ---
-    _STEM_SUFFIX_MAP = [
-        ("controller", "API controller"), ("service", "service"),
-        ("repository", "repository"), ("gateway", "gateway"),
-        ("registry", "registry"), ("agent", "agent"),
-        ("store", "state store"), ("factory", "factory"),
-        ("strategy", "Strategy pattern"), ("observer", "Observer pattern"),
-        ("builder", "Builder pattern"), ("command", "Command pattern"),
-        ("mediator", "Mediator pattern"), ("visitor", "Visitor pattern"),
-        ("facade", "Facade pattern"), ("proxy", "Proxy pattern"),
-        ("composite", "Composite pattern"), ("aggregate", "aggregate root"),
-        ("specification", "Specification pattern"), ("adapter", "adapter"),
-        ("provider", "provider"), ("processor", "processor"),
-        ("handler", "event handler"), ("listener", "event listener"),
-        ("middleware", "middleware"), ("interceptor", "interceptor"),
-        ("scheduler", "scheduler"), ("worker", "worker"),
-        ("dispatcher", "dispatcher"), ("subscriber", "subscriber"),
-        ("resolver", "resolver"), ("manager", "manager"),
-        ("connector", "connector"), ("client", "client"),
-        ("policy", "policy"), ("plugin", "plugin"),
-    ]
-    if not parts and len(stem) >= 5:
-        for sfx, purpose_label in _STEM_SUFFIX_MAP:
-            if _fuzzy_suffix_match(stem, sfx):
-                parts.append(purpose_label)
-                break
-
-    # --- Content-based heuristics (checked against first 4K) ---
-    head4k = content[:4096]
-    if not parts:
-        if re.search(r"export\s+(?:const\s+)?enum\s+", head4k):
-            parts.append("enum definitions")
-        elif re.search(r"export\s+(?:type|interface)\s+", head4k) and not re.search(
-            r"export\s+(?:class|function|const\s+\w+\s*=)", head4k
-        ):
-            parts.append("type definitions")
-        elif re.search(r"^export\s+\{", head4k, re.MULTILINE) and not re.search(
-            r"^(?:class|function|const|let|var)\s", head4k, re.MULTILINE
-        ):
-            parts.append("barrel re-exports")
-        elif re.search(r"export\s+(?:default\s+)?(?:const\s+)?(?:config|CONFIG|configuration)\b", head4k):
-            parts.append("configuration")
-        elif (
-            language == "python"
-            and re.search(r"^from\s+\.\w+\s+import\s+", head4k, re.MULTILINE)
-            and len(content) < 500
-        ):
-            parts.append("package re-exports")
-
-    # --- Entity-kind heuristic: only type/interface/enum entities => type definitions ---
-    if not parts and entities:
-        kinds = {
-            (ent.get("kind", "") if isinstance(ent, dict) else ent.kind)
-            for ent in entities
-        }
-        if kinds and kinds <= {"interface", "type", "enum"}:
-            if kinds == {"enum"}:
-                parts.append("enum definitions")
-            else:
-                parts.append("type definitions")
-
-    return "; ".join(parts) if parts else "general module"
-
-
-def detect_validation(content: str, language: str) -> bool:
-    if language == "python":
-        # Explicit validation frameworks
-        if re.search(
-            r"pydantic|BaseModel|validator|field_validator|Annotated\[|attrs|@attr",
-            content[:4096],
-        ):
-            return True
-        # Typed dataclass schemas used as validation boundary (frozen=True or type-annotated)
-        if re.search(r"@dataclass", content[:4096]) and re.search(
-            r"frozen\s*=\s*True|def\s+__post_init__|:\s*(?:str|int|float|bool|list|dict|Optional)", content[:4096],
-        ):
-            return True
-        # TypedDict / NamedTuple schemas
-        if re.search(r"TypedDict|NamedTuple", content[:4096]):
-            return True
-        return False
-    return bool(re.search(
-        r"\.safeParse|\.parse\(|zod\.|z\.|Joi\.|yup\.|ajv|validateSchema",
-        content[:4096],
-    ))
-
 
 def path_to_uri(path: str) -> str:
     """Convert an absolute file path to a file:// URI."""
@@ -811,541 +230,15 @@ def find_entity_column(content: str, entity_name: str, line_1based: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Python parser
-# ---------------------------------------------------------------------------
-
-def parse_python(path: str, content: str, repo: str, mtime: float) -> FileResult:
-    imports: list[str] = []
-    exports_abstract: list[str] = []
-    implements: list[str] = []
-    extends: list[str] = []
-    entities: list[Entity] = []
-    imported_names: list[ImportedName] = []
-    exported_names: list[str] = []
-
-    try:
-        tree = ast.parse(content, filename=path)
-
-        # Imports can be conditional or function-local, so walk the full tree.
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.append(alias.name)
-                    local = alias.asname or alias.name.split(".")[-1]
-                    imported_names.append(ImportedName(
-                        local_name=local,
-                        original_name=alias.name,
-                        module=alias.name,
-                    ))
-            elif isinstance(node, ast.ImportFrom):
-                mod = ("." * node.level) + (node.module or "")
-                if mod:
-                    imports.append(mod)
-                for alias in node.names:
-                    local = alias.asname or alias.name
-                    imported_names.append(ImportedName(
-                        local_name=local,
-                        original_name=alias.name,
-                        module=mod,
-                    ))
-
-        # Entities remain top-level so nested functions do not become modules.
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.ClassDef):
-                methods = []
-                decorators = [
-                    _decorator_name(d) for d in node.decorator_list
-                ]
-                for item in node.body:
-                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        methods.append(item.name)
-                bases_list = [_name_of(b) for b in node.bases if _name_of(b)]
-                entities.append(Entity(
-                    name=node.name,
-                    kind="class",
-                    line=node.lineno,
-                    methods=methods,
-                    decorators=decorators,
-                    bases=bases_list,
-                ))
-                exported_names.append(node.name)
-                extends.extend(bases_list)
-                for b in bases_list:
-                    if b in ("ABC", "Protocol") or "Base" in b:
-                        implements.append(b)
-
-            # -- functions --
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                decorators = [
-                    _decorator_name(d) for d in node.decorator_list
-                ]
-                entities.append(Entity(
-                    name=node.name,
-                    kind="function",
-                    line=node.lineno,
-                    methods=[],
-                    decorators=decorators,
-                    bases=[],
-                ))
-                exported_names.append(node.name)
-
-            # -- top-level assignments (constants, type aliases) --
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id.isupper():
-                        exported_names.append(target.id)
-
-    except SyntaxError as exc:
-        print(f"[belief-map] WARNING: AST parse failed for {path}: {exc}", file=sys.stderr)
-        # Fallback: regex for imports only
-        for m in re.finditer(
-            r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))",
-            content, re.MULTILINE,
-        ):
-            imp = m.group(1) or m.group(2)
-            if imp:
-                imports.append(imp)
-
-    # Detect ABC / Protocol definitions
-    for m in PY_ABC_RE.finditer(content):
-        name = m.group(0).split("(")[0].split()[-1]
-        if name not in exports_abstract:
-            exports_abstract.append(name)
-
-    return FileResult(
-        path=path, language="python", repo=repo, mtime=mtime,
-        content_hash=file_hash(path),
-        imports=imports, exports_abstract=exports_abstract,
-        implements=implements, extends=extends,
-        purpose=infer_purpose(path, content, "python", [e.to_dict() for e in entities]),
-        naming_convention=detect_naming(path),
-        has_validation=detect_validation(content, "python"),
-        entities=[e.to_dict() for e in entities],
-        imported_names=[n.to_dict() for n in imported_names],
-        exported_names=exported_names,
-    )
-
-
-def _decorator_name(node: ast.expr) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    if isinstance(node, ast.Call):
-        return _decorator_name(node.func)
-    return ""
-
-
-def _name_of(node: ast.expr) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# TypeScript parser (tree-sitter)
-# ---------------------------------------------------------------------------
-
-def _ts_get_decorators(node) -> list[str]:  # type: ignore[no-untyped-def]
-    """Extract @Decorator names from a node's preceding decorator nodes."""
-    decorators = []
-    for child in node.children:
-        if child.type == "decorator":
-            # decorator -> @expression -- get the identifier
-            for dchild in child.children:
-                if dchild.type == "identifier":
-                    decorators.append(dchild.text.decode("utf-8"))
-                elif dchild.type == "call_expression":
-                    fn = dchild.child_by_field_name("function")
-                    if fn:
-                        decorators.append(fn.text.decode("utf-8").split(".")[-1])
-    return decorators
-
-
-def _ts_get_heritage(node) -> tuple[list[str], list[str]]:  # type: ignore[no-untyped-def]
-    """Extract extends and implements from class_heritage."""
-    extends: list[str] = []
-    implements: list[str] = []
-    for child in node.children:
-        if child.type == "class_heritage":
-            for hchild in child.children:
-                if hchild.type == "extends_clause":
-                    for t in hchild.children:
-                        if t.type in ("type_identifier", "identifier"):
-                            extends.append(t.text.decode("utf-8"))
-                elif hchild.type == "implements_clause":
-                    for t in hchild.children:
-                        if t.type in ("type_identifier", "identifier"):
-                            implements.append(t.text.decode("utf-8"))
-    return extends, implements
-
-
-def _ts_get_methods(node) -> list[str]:  # type: ignore[no-untyped-def]
-    """Extract method/property names from a class or interface body."""
-    methods = []
-    body = node.child_by_field_name("body")
-    if not body:
-        return methods
-    skip = {"constructor", "if", "for", "while", "switch", "return"}
-    for member in body.children:
-        if member.type in ("method_definition", "method_signature",
-                           "public_field_definition", "property_signature",
-                           "abstract_method_signature"):
-            name_node = member.child_by_field_name("name")
-            if name_node:
-                name = name_node.text.decode("utf-8")
-                if name not in skip:
-                    methods.append(name)
-    return methods
-
-
-# NestJS decorators that imply constructor-parameter dependency injection.
-_NESTJS_INJECTION_DECOS: frozenset[str] = frozenset({
-    "Injectable", "Controller", "Module", "Guard", "Interceptor", "Pipe", "Resolver",
-})
-
-
-def _ts_get_constructor_injections(node) -> list[str]:  # type: ignore[no-untyped-def]
-    """Extract interface/type names from constructor parameter types and @Inject decorators.
-
-    Handles NestJS constructor injection patterns where typed constructor parameters
-    declare interface dependencies. Only PascalCase names are returned to avoid
-    tracking primitive or built-in types.
-    """
-    injected: list[str] = []
-    body = node.child_by_field_name("body")
-    if not body:
-        return injected
-    for member in body.children:
-        if member.type != "method_definition":
-            continue
-        name_node = member.child_by_field_name("name")
-        if not name_node or not name_node.text:
-            continue
-        if name_node.text.decode("utf-8") != "constructor":
-            continue
-        params = member.child_by_field_name("parameters")
-        if not params:
-            continue
-        for param in params.children:
-            if param.type not in ("required_parameter", "optional_parameter"):
-                continue
-            # Check for @Inject(TOKEN) decorator on the parameter
-            for child in param.children:
-                if child.type == "decorator":
-                    for dc in child.children:
-                        if dc.type == "call_expression":
-                            fn = dc.child_by_field_name("function")
-                            if fn and fn.text and fn.text.decode("utf-8") == "Inject":
-                                args = dc.child_by_field_name("arguments")
-                                if args:
-                                    for arg in args.children:
-                                        if arg.type in ("identifier", "string", "template_string"):
-                                            text = arg.text
-                                            if text:
-                                                token = text.decode("utf-8").strip("'\"`")
-                                                if token and token[0].isupper():
-                                                    injected.append(token)
-            # Check type annotation on the parameter
-            type_ann = param.child_by_field_name("type")
-            if type_ann:
-                for tc in type_ann.children:
-                    if tc.type in ("type_identifier", "identifier"):
-                        ttext = tc.text
-                        if ttext:
-                            tname = ttext.decode("utf-8")
-                            if tname and tname[0].isupper():
-                                injected.append(tname)
-    return injected
-
-
-def _ts_get_obj_keys(node) -> list[str]:  # type: ignore[no-untyped-def]
-    """Extract top-level property names from an object literal."""
-    keys = []
-    for child in node.children:
-        if child.type in ("pair", "method_definition", "shorthand_property_identifier"):
-            if child.type == "shorthand_property_identifier":
-                keys.append(child.text.decode("utf-8"))
-            else:
-                key = child.child_by_field_name("key")
-                if key:
-                    keys.append(key.text.decode("utf-8"))
-    return keys
-
-
-def _ts_dependency_specifiers(root) -> list[str]:  # type: ignore[no-untyped-def]
-    """Extract static and literal runtime dependencies in source order."""
-    dependencies: list[str] = []
-    seen: set[str] = set()
-
-    def _append_literal(node) -> None:  # type: ignore[no-untyped-def]
-        if node is None or not node.text:
-            return
-        if node.type == "string":
-            specifier = node.text.decode("utf-8").strip("'\"")
-        elif node.type == "template_string":
-            if any(
-                child.type == "template_substitution"
-                for child in node.named_children
-            ):
-                return
-            specifier = node.text.decode("utf-8").strip("`")
-        else:
-            return
-        if specifier and specifier not in seen:
-            seen.add(specifier)
-            dependencies.append(specifier)
-
-    def _visit(node) -> None:  # type: ignore[no-untyped-def]
-        if node.type in ("import_statement", "export_statement"):
-            source = node.child_by_field_name("source")
-            if source is None and node.type == "import_statement":
-                import_require = next(
-                    (
-                        child
-                        for child in node.named_children
-                        if child.type == "import_require_clause"
-                    ),
-                    None,
-                )
-                if import_require is not None:
-                    source = import_require.child_by_field_name("source")
-            _append_literal(source)
-        elif node.type == "call_expression":
-            function = node.child_by_field_name("function")
-            function_name = (
-                function.text.decode("utf-8")
-                if function is not None and function.text
-                else ""
-            )
-            if function_name in ("import", "require"):
-                arguments = node.child_by_field_name("arguments")
-                if arguments is not None:
-                    first_argument = next(iter(arguments.named_children), None)
-                    _append_literal(first_argument)
-
-        for child in node.named_children:
-            _visit(child)
-
-    _visit(root)
-    return dependencies
-
-
-def parse_typescript_treesitter(
-    path: str, content: str, repo: str, mtime: float,
-) -> FileResult:
-    """Parse a TypeScript file using tree-sitter for precise entity extraction."""
-    lang = _TSX_LANG if path.endswith(".tsx") else _TS_LANG
-    parser = _TsParser(lang)
-    tree = parser.parse(content.encode("utf-8"))
-    root = tree.root_node
-
-    imports = _ts_dependency_specifiers(root)
-    exports_abstract: list[str] = []
-    implements_list: list[str] = []
-    extends_list: list[str] = []
-    entities: list[Entity] = []
-    imported_names: list[ImportedName] = []
-    exported_names: list[str] = []
-
-    for node in root.children:
-        is_export = node.type == "export_statement"
-        target = node
-        if is_export:
-            # The actual declaration is a child of export_statement.
-            # Skip keywords, decorators, and punctuation to find the declaration.
-            for child in node.children:
-                if child.type in ("export", "default", "comment", "decorator",
-                                  "{", "}", ",", ";"):
-                    continue
-                target = child
-                break
-
-        # -- Imports --
-        if node.type == "import_statement":
-            source_node = node.child_by_field_name("source")
-            if source_node:
-                specifier = source_node.text.decode("utf-8").strip("'\"")
-                # Extract named imports
-                for child in node.children:
-                    if child.type == "import_clause":
-                        for ic in child.children:
-                            if ic.type == "identifier":
-                                # default import
-                                imported_names.append(ImportedName(
-                                    local_name=ic.text.decode("utf-8"),
-                                    original_name="default",
-                                    module=specifier,
-                                ))
-                            elif ic.type == "named_imports":
-                                for spec in ic.children:
-                                    if spec.type == "import_specifier":
-                                        name_node = spec.child_by_field_name("name")
-                                        alias_node = spec.child_by_field_name("alias")
-                                        if name_node:
-                                            orig = name_node.text.decode("utf-8")
-                                            local = alias_node.text.decode("utf-8") if alias_node else orig
-                                            imported_names.append(ImportedName(
-                                                local_name=local,
-                                                original_name=orig,
-                                                module=specifier,
-                                            ))
-
-        # -- Class --
-        elif target.type == "class_declaration":
-            name_node = target.child_by_field_name("name")
-            if not name_node:
-                continue
-            name = name_node.text.decode("utf-8")
-            line = target.start_point[0] + 1
-            decorators = _ts_get_decorators(node if is_export else target)
-            ext, impl = _ts_get_heritage(target)
-            methods = _ts_get_methods(target)
-            extends_list.extend(ext)
-            implements_list.extend(impl)
-            # NestJS @Injectable/@Controller/@Module: constructor param types are
-            # interface dependencies that should create CALLS_API edges.
-            if _NESTJS_INJECTION_DECOS.intersection(decorators):
-                constructor_deps = _ts_get_constructor_injections(target)
-                implements_list.extend(constructor_deps)
-            # Check if abstract
-            is_abstract = any(c.type == "abstract" for c in target.children)
-            if is_abstract:
-                exports_abstract.append(name)
-            entities.append(Entity(
-                name=name, kind="class", line=line,
-                methods=methods, decorators=decorators, bases=ext + impl,
-            ))
-            exported_names.append(name)
-
-        # -- Interface --
-        elif target.type == "interface_declaration":
-            name_node = target.child_by_field_name("name")
-            if not name_node:
-                continue
-            name = name_node.text.decode("utf-8")
-            line = target.start_point[0] + 1
-            methods = _ts_get_methods(target)
-            exports_abstract.append(name)
-            entities.append(Entity(
-                name=name, kind="interface", line=line,
-                methods=methods, decorators=[], bases=[],
-            ))
-            exported_names.append(name)
-
-        # -- Type alias --
-        elif target.type == "type_alias_declaration":
-            name_node = target.child_by_field_name("name")
-            if not name_node:
-                continue
-            name = name_node.text.decode("utf-8")
-            line = target.start_point[0] + 1
-            entities.append(Entity(
-                name=name, kind="type", line=line,
-                methods=[], decorators=[], bases=[],
-            ))
-            exported_names.append(name)
-
-        # -- Enum --
-        elif target.type == "enum_declaration":
-            name_node = target.child_by_field_name("name")
-            if not name_node:
-                continue
-            name = name_node.text.decode("utf-8")
-            line = target.start_point[0] + 1
-            entities.append(Entity(
-                name=name, kind="enum", line=line,
-                methods=[], decorators=[], bases=[],
-            ))
-            exported_names.append(name)
-
-        # -- Function --
-        elif target.type == "function_declaration":
-            name_node = target.child_by_field_name("name")
-            if not name_node:
-                continue
-            name = name_node.text.decode("utf-8")
-            line = target.start_point[0] + 1
-            decorators = _ts_get_decorators(node if is_export else target)
-            entities.append(Entity(
-                name=name, kind="function", line=line,
-                methods=[], decorators=decorators, bases=[],
-            ))
-            exported_names.append(name)
-
-        # -- Lexical declaration (const/let) --
-        elif target.type == "lexical_declaration":
-            for declarator in target.children:
-                if declarator.type != "variable_declarator":
-                    continue
-                name_node = declarator.child_by_field_name("name")
-                if not name_node or name_node.type != "identifier":
-                    continue
-                name = name_node.text.decode("utf-8")
-                line = declarator.start_point[0] + 1
-                value = declarator.child_by_field_name("value")
-                if not value:
-                    continue
-                # Object literal: extract keys as methods
-                if value.type == "object":
-                    obj_keys = _ts_get_obj_keys(value)
-                    entities.append(Entity(
-                        name=name, kind="function", line=line,
-                        methods=obj_keys, decorators=[], bases=[],
-                    ))
-                # new Constructor(...)
-                elif value.type == "new_expression":
-                    entities.append(Entity(
-                        name=name, kind="function", line=line,
-                        methods=[], decorators=[], bases=[],
-                    ))
-                # Arrow function or call expression
-                elif value.type in ("arrow_function", "call_expression"):
-                    entities.append(Entity(
-                        name=name, kind="function", line=line,
-                        methods=[], decorators=[], bases=[],
-                    ))
-                # Other const (e.g., z.object, string literal, etc.)
-                else:
-                    entities.append(Entity(
-                        name=name, kind="function", line=line,
-                        methods=[], decorators=[], bases=[],
-                    ))
-                exported_names.append(name)
-
-    file_lang = "tsx" if path.endswith(".tsx") else "typescript"
-    return FileResult(
-        path=path, language=file_lang, repo=repo, mtime=mtime,
-        content_hash=file_hash(path),
-        imports=imports, exports_abstract=exports_abstract,
-        implements=implements_list, extends=extends_list,
-        purpose=infer_purpose(path, content, "typescript", [e.to_dict() for e in entities]),
-        naming_convention=detect_naming(path),
-        has_validation=detect_validation(content, "typescript"),
-        entities=[e.to_dict() for e in entities],
-        imported_names=[n.to_dict() for n in imported_names],
-        exported_names=exported_names,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-def parse_file(args: tuple[str, str, str]) -> Optional[FileResult]:
-    path, language, repo = args
-    try:
-        mtime = os.path.getmtime(path)
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-        if language == "python":
-            return parse_python(path, content, repo, mtime)
-        return parse_typescript_treesitter(path, content, repo, mtime)
-    except Exception as exc:
-        print(f"[belief-map] ERROR: could not parse {path}: {exc}", file=sys.stderr)
-        return None
+def parse_file(args: tuple[str, str, str]) -> FileResult:
+    path, language_name, repo = args
+    mtime = os.path.getmtime(path)
+    with open(path, "r", encoding="utf-8", errors="replace") as source_file:
+        content = source_file.read()
+    return language_for_name(language_name).parse(path, content, repo, mtime)
 
 
 # ---------------------------------------------------------------------------
@@ -1354,11 +247,8 @@ def parse_file(args: tuple[str, str, str]) -> Optional[FileResult]:
 
 def detect_source_language(filename: str) -> Optional[str]:
     """Return the supported parser language for a source filename."""
-    if filename.endswith(".py"):
-        return "python"
-    if (filename.endswith(".ts") or filename.endswith(".tsx")) and not filename.endswith(".d.ts"):
-        return "typescript"
-    return None
+    language = language_for_file(filename)
+    return language.name if language is not None else None
 
 
 def discover_files(root: str) -> list[tuple[str, str, str]]:
@@ -1377,9 +267,9 @@ def discover_files(root: str) -> list[tuple[str, str, str]]:
                             child_repo = entry.name
                         _walk(dir_path / entry.name, child_repo)
                     elif entry.is_file(follow_symlinks=False):
-                        language = detect_source_language(entry.name)
+                        language = language_for_file(entry.name)
                         if language is not None:
-                            results.append((entry.path, language, repo))
+                            results.append((entry.path, language.name, repo))
         except PermissionError as exc:
             print(f"[belief-map] WARNING: could not scan {dir_path}: {exc}", file=sys.stderr)
 
@@ -1393,9 +283,14 @@ def discover_files(root: str) -> list[tuple[str, str, str]]:
 
 def _builder_fingerprint() -> str:
     """Fingerprint parser code, dependencies, and behavior-affecting config."""
+    dependency_packages = sorted({
+        package
+        for language in LANGUAGES
+        for package in language.dependency_packages
+    })
     dependency_versions = "|".join(
         f"{name}={importlib.metadata.version(name)}"
-        for name in ("tree-sitter", "tree-sitter-typescript")
+        for name in dependency_packages
     )
     config = "|".join(
         (
@@ -1406,9 +301,15 @@ def _builder_fingerprint() -> str:
     )
     digest = hashlib.sha256()
     digest.update(config.encode("utf-8"))
-    with open(__file__, "rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
+    source_paths = (
+        Path(__file__),
+        *sorted((Path(__file__).parent / "lang").rglob("*.py")),
+    )
+    for source_path in source_paths:
+        digest.update(str(source_path.relative_to(Path(__file__).parent)).encode())
+        with open(source_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -1546,365 +447,17 @@ def is_cache_entry_current(path: str, entry: object) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Import resolution
-# ---------------------------------------------------------------------------
-# TypeScript path alias resolution (tsconfig.json "paths")
-# ---------------------------------------------------------------------------
-
-def _load_ts_path_aliases(root: str) -> tuple[TsPathAliasContext, ...]:
-    """Load validated path mappings without merging independent projects."""
-    import json as _json
-
-    contexts: list[TsPathAliasContext] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in ("node_modules", ".git", "dist", "build", ".next", ".cache")
-        ]
-        for fname in filenames:
-            if fname != "tsconfig.json":
-                continue
-
-            tsconfig_path = os.path.join(dirpath, fname)
-            try:
-                with open(tsconfig_path, "r", encoding="utf-8") as file:
-                    raw = file.read()
-                raw = re.sub(r"//.*$", "", raw, flags=re.MULTILINE)
-                raw = re.sub(r",(\s*[}\]])", r"\1", raw)
-                data = _json.loads(raw)
-            except (OSError, _json.JSONDecodeError) as error:
-                print(
-                    f"[belief-map] Cannot read TS aliases from {tsconfig_path}: {error}",
-                    file=sys.stderr,
-                )
-                continue
-
-            if not isinstance(data, dict):
-                continue
-            compiler_options = data.get("compilerOptions")
-            if not isinstance(compiler_options, dict):
-                continue
-            paths = compiler_options.get("paths")
-            if not isinstance(paths, dict):
-                continue
-            configured_base = compiler_options.get("baseUrl", ".")
-            if not isinstance(configured_base, str):
-                continue
-            base_directory = os.path.normpath(os.path.join(dirpath, configured_base))
-
-            aliases: list[TsPathAlias] = []
-            for alias_pattern, targets in paths.items():
-                if not isinstance(alias_pattern, str):
-                    continue
-                if not isinstance(targets, list):
-                    continue
-                target_patterns = tuple(
-                    os.path.normpath(os.path.join(base_directory, target))
-                    for target in targets
-                    if isinstance(target, str)
-                )
-                if target_patterns:
-                    aliases.append(TsPathAlias(alias_pattern, target_patterns))
-
-            if aliases:
-                contexts.append(TsPathAliasContext(
-                    config_directory=os.path.normpath(dirpath),
-                    aliases=tuple(sorted(
-                        aliases,
-                        key=lambda alias: len(alias.pattern),
-                        reverse=True,
-                    )),
-                ))
-
-    return tuple(sorted(
-        contexts,
-        key=lambda context: len(Path(context.config_directory).parts),
-        reverse=True,
-    ))
-
-
-def _load_ts_packages(root: str) -> tuple[TsPackage, ...]:
-    """Load local package identities used by workspace self-imports."""
-    packages: list[TsPackage] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [directory for directory in dirnames if directory not in SKIP_DIRS]
-        if "package.json" not in filenames:
-            continue
-
-        package_path = os.path.join(dirpath, "package.json")
-        try:
-            with open(package_path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (OSError, json.JSONDecodeError) as error:
-            print(
-                f"[belief-map] Cannot read local package identity from {package_path}: {error}",
-                file=sys.stderr,
-            )
-            continue
-
-        if not isinstance(data, dict):
-            continue
-        name = data.get("name")
-        if isinstance(name, str) and name:
-            packages.append(TsPackage(name, os.path.normpath(dirpath)))
-
-    return tuple(sorted(packages, key=lambda package: len(package.name), reverse=True))
-
-
-def _typescript_resolution_bases(resolved: str) -> tuple[str, ...]:
-    """Return filesystem bases for TypeScript ESM specifiers such as `.js`."""
-    for emitted_suffix in (".js", ".jsx", ".mjs", ".cjs"):
-        if resolved.endswith(emitted_suffix):
-            return (resolved[: -len(emitted_suffix)], resolved)
-    return (resolved,)
-
-
-def _resolve_typescript_path(
-    resolved: str,
-    root: str,
-    path_to_id: dict[str, str],
-) -> Optional[str]:
-    for base in _typescript_resolution_bases(resolved):
-        for ext in ("", ".ts", ".tsx", "/index.ts", "/index.tsx"):
-            candidate = base + ext
-            if candidate in path_to_id:
-                return path_to_id[candidate]
-            try:
-                relative_candidate = os.path.relpath(candidate, root)
-            except ValueError:
-                relative_candidate = candidate
-            if relative_candidate in path_to_id:
-                return path_to_id[relative_candidate]
-    return None
-
-
-def _is_within(path: str, directory: str) -> bool:
-    try:
-        return os.path.commonpath((path, directory)) == directory
-    except ValueError:
-        return False
-
-
-def _match_ts_alias(pattern: str, imp: str) -> Optional[str]:
-    if "*" not in pattern:
-        return "" if imp == pattern else None
-    prefix, suffix = pattern.split("*", 1)
-    if not imp.startswith(prefix) or not imp.endswith(suffix):
-        return None
-    remainder_end = len(imp) - len(suffix) if suffix else len(imp)
-    return imp[len(prefix):remainder_end]
-
-
-def _resolve_ts_path_alias(
-    imp: str,
-    source_path: str,
-    root: str,
-    path_to_id: dict[str, str],
-    alias_contexts: tuple[TsPathAliasContext, ...],
-) -> Optional[str]:
-    """Resolve an alias only through tsconfigs that own the source file."""
-    if not alias_contexts:
-        return None
-
-    absolute_source = os.path.normpath(
-        source_path if os.path.isabs(source_path) else os.path.join(root, source_path)
-    )
-    for context in alias_contexts:
-        if not _is_within(absolute_source, context.config_directory):
-            continue
-        for alias in context.aliases:
-            remainder = _match_ts_alias(alias.pattern, imp)
-            if remainder is None:
-                continue
-            for target_pattern in alias.target_patterns:
-                resolved = target_pattern.replace("*", remainder, 1)
-                target_id = _resolve_typescript_path(resolved, root, path_to_id)
-                if target_id:
-                    return target_id
-
-    return None
-
-
-def _resolve_ts_package(
-    imp: str,
-    source_path: str,
-    root: str,
-    path_to_id: dict[str, str],
-    packages: tuple[TsPackage, ...],
-) -> Optional[str]:
-    """Resolve package self-imports without shadowing installed dependencies."""
-    absolute_source = os.path.normpath(
-        source_path if os.path.isabs(source_path) else os.path.join(root, source_path)
-    )
-    owners = tuple(
-        package
-        for package in packages
-        if _is_within(absolute_source, package.directory)
-    )
-    if not owners:
-        return None
-
-    owner = max(owners, key=lambda package: len(Path(package.directory).parts))
-    if imp != owner.name:
-        return None
-
-    for candidate in (
-        os.path.join(owner.directory, "src", "index"),
-        os.path.join(owner.directory, "index"),
-    ):
-        target_id = _resolve_typescript_path(candidate, root, path_to_id)
-        if target_id:
-            return target_id
-    return None
-
-
-# ---------------------------------------------------------------------------
-
-def resolve_import(
-    imp: str,
-    source_path: str,
-    root: str,
-    path_to_id: dict[str, str],
-    language: str,
-    ts_path_aliases: "tuple[TsPathAliasContext, ...] | None" = None,
-    ts_packages: "tuple[TsPackage, ...] | None" = None,
-) -> Optional[str]:
-    if language in ("typescript", "tsx"):
-        if not imp.startswith(".") and not imp.startswith("/"):
-            # Try tsconfig paths alias resolution before giving up
-            resolved_via_alias = _resolve_ts_path_alias(
-                imp, source_path, root, path_to_id, ts_path_aliases or (),
-            )
-            if resolved_via_alias:
-                return resolved_via_alias
-            return _resolve_ts_package(
-                imp,
-                source_path,
-                root,
-                path_to_id,
-                ts_packages or (),
-            )
-        source_dir = os.path.dirname(source_path)
-        resolved = os.path.normpath(os.path.join(source_dir, imp))
-        return _resolve_typescript_path(resolved, root, path_to_id)
-    elif language == "python":
-        relative_level = len(imp) - len(imp.lstrip("."))
-        module_name = imp[relative_level:]
-        parts = [part for part in module_name.split(".") if part]
-        # Build candidate base directories: walk up from source_dir to root,
-        # collecting every directory that contains the first import segment.
-        source_dir = Path(os.path.abspath(source_path)).parent
-        root_path = Path(os.path.abspath(root))
-        if relative_level:
-            relative_base = source_dir
-            for _ in range(relative_level - 1):
-                relative_base = relative_base.parent
-            bases: list[str] = [str(relative_base)]
-        else:
-            bases = [str(root_path), str(source_dir)]
-        first_segment = parts[0] if parts else ""
-        cur = source_dir
-        while not relative_level and (cur == root_path or root_path in cur.parents):
-            cur_str = str(cur)
-            if first_segment and (cur / first_segment).is_dir() and cur_str not in bases:
-                bases.append(cur_str)
-            if cur == root_path:
-                break
-            cur = cur.parent
-        for base in bases:
-            # Try direct .py file first, then __init__.py
-            for ext in (".py", "/__init__.py"):
-                if ext == ".py":
-                    candidate = os.path.join(base, *parts) + ext
-                else:
-                    candidate = os.path.join(base, *parts, "__init__.py")
-                candidate = os.path.normpath(candidate)
-                if candidate in path_to_id:
-                    return path_to_id[candidate]
-            # Gap 4 fix: "from modules.commons import json_doc_sqlite"
-            # The AST records module="modules.commons", name="json_doc_sqlite".
-            # Check if the imported names include a sub-module file.
-            if len(parts) >= 2:
-                pkg_dir = os.path.join(base, *parts)
-                if os.path.isdir(pkg_dir):
-                    # This is a package -- imported names may be sub-modules.
-                    # resolve_import is called per import specifier (module level),
-                    # so we already resolved to __init__.py above. The sub-module
-                    # resolution happens in _resolve_submodule_imports below.
-                    pass
-    return None
-
-
-def _resolve_submodule_imports(
-    result: "FileResult",
-    root: str,
-    path_to_id: dict[str, str],
-) -> list[str]:
-    """
-    Fix Python 'from package import submodule' patterns.
-
-    When `from modules.commons import json_doc_sqlite` is parsed, the AST
-    records module='modules.commons' and name='json_doc_sqlite'. If
-    json_doc_sqlite.py exists as a sibling file, add it as an extra import.
-    """
-    extra_imports: list[str] = []
-    if result.language != "python":
-        return extra_imports
-
-    # Build base dirs: walk up from source to root (same as resolve_import)
-    root_path = Path(os.path.abspath(root))
-    source_dir = Path(os.path.abspath(result.path)).parent
-    all_bases: list[str] = [str(root_path), str(source_dir)]
-    for imp_name in result.imported_names:
-        mod = imp_name.get("module", "") if isinstance(imp_name, dict) else imp_name.module
-        orig = imp_name.get("original", "") if isinstance(imp_name, dict) else imp_name.original_name
-        if not mod or not orig:
-            continue
-        relative_level = len(mod) - len(mod.lstrip("."))
-        module_name = mod[relative_level:]
-        parts = [part for part in module_name.split(".") if part]
-        first_seg = parts[0] if parts else ""
-
-        # Collect all viable bases including walk-up
-        if relative_level:
-            relative_base = source_dir
-            for _ in range(relative_level - 1):
-                relative_base = relative_base.parent
-            bases = [str(relative_base)]
-        else:
-            bases = list(all_bases)
-        cur = source_dir
-        while not relative_level and (cur == root_path or root_path in cur.parents):
-            cur_str = str(cur)
-            if first_seg and (cur / first_seg).is_dir() and cur_str not in bases:
-                bases.append(cur_str)
-            if cur == root_path:
-                break
-            cur = cur.parent
-
-        for base in bases:
-            submod_path = os.path.normpath(os.path.join(base, *parts, orig + ".py"))
-            if submod_path in path_to_id:
-                target_id = path_to_id[submod_path]
-                if target_id not in extra_imports:
-                    extra_imports.append(target_id)
-                break
-
-    return extra_imports
+# Import resolution is owned by the bound language adapters.
 
 
 def make_node_id(path: str, root: str) -> str:
-    rel = os.path.relpath(path, root).replace(os.sep, "/")
-    for ext in (".tsx", ".ts", ".py"):
-        if rel.endswith(ext):
-            rel = rel[: -len(ext)]
-            break
-    if rel.endswith("/index"):
-        rel = rel[: -len("/index")]
-    return rel
+    relative_path = os.path.relpath(path, root).replace(os.sep, "/")
+    language = language_for_file(os.path.basename(path))
+    if language is None:
+        raise ValueError(f"Unsupported source path: {relative_path}")
+    return language.normalize_module_id(relative_path)
 
 
-# ---------------------------------------------------------------------------
 # Graph building
 # ---------------------------------------------------------------------------
 
@@ -1950,11 +503,8 @@ def _imported_name_parts(raw: object) -> Optional[tuple[str, str]]:
 def _resolve_provider(
     symbol: str,
     source: FileResult,
-    root: str,
-    path_to_id: dict[str, str],
+    bound_language: BoundLanguage,
     provider_candidates: dict[str, set[str]],
-    ts_path_aliases: tuple[TsPathAliasContext, ...],
-    ts_packages: tuple[TsPackage, ...],
 ) -> Optional[str]:
     """Resolve a provider through an explicit import, otherwise fail closed."""
     for imported_name in source.imported_names:
@@ -1964,15 +514,7 @@ def _resolve_provider(
         local_name, module = imported_parts
         if local_name != symbol:
             continue
-        return resolve_import(
-            module,
-            source.path,
-            root,
-            path_to_id,
-            source.language,
-            ts_path_aliases,
-            ts_packages,
-        )
+        return bound_language.resolve_import(module, source.path)
 
     candidates = provider_candidates.get(symbol, set())
     if len(candidates) == 1:
@@ -1988,13 +530,12 @@ def build_graph(
         return index_result
     path_to_id, id_to_result = index_result.value
 
-    # Load tsconfig.json path aliases for resolving @sdk/*, @agent-*/* etc.
-    ts_path_aliases = _load_ts_path_aliases(root)
-    if ts_path_aliases:
-        print(f"[belief-map] Loaded {len(ts_path_aliases)} TS alias contexts", file=sys.stderr)
-    ts_packages = _load_ts_packages(root)
-    if ts_packages:
-        print(f"[belief-map] Loaded {len(ts_packages)} local TS packages", file=sys.stderr)
+    result_languages = {result.language for result in results}
+    bound_languages = {
+        language.name: language.bind(root, path_to_id, frozenset(SKIP_DIRS))
+        for language in LANGUAGES
+        if result_languages.intersection(language.result_languages)
+    }
 
     # Map every abstract/interface name to every provider. Resolution prefers
     # the consumer's explicit import and otherwise accepts only one candidate.
@@ -2031,6 +572,8 @@ def build_graph(
     seen_edges: set[tuple] = set()
 
     for node_id, r in id_to_result.items():
+        language = language_for_result(r.language)
+        bound_language = bound_languages[language.name]
         rel_path = os.path.relpath(r.path, root)
 
         # Gap 3 fix: enrich purpose with entity-name heuristics
@@ -2056,8 +599,8 @@ def build_graph(
             node["entities"] = r.entities
         nodes.append(node)
 
-        # -- Gap 4: sub-module Python imports --
-        extra_submod_ids = _resolve_submodule_imports(r, root, path_to_id)
+        # Some language forms carry additional local import targets.
+        extra_submod_ids = bound_language.resolve_additional_imports(r)
         for target_id in extra_submod_ids:
             if target_id != node_id:
                 edge_key = (node_id, target_id, "IMPORTS")
@@ -2074,15 +617,7 @@ def build_graph(
 
         # -- module-level IMPORTS edges --
         for imp in r.imports:
-            target_id = resolve_import(
-                imp,
-                r.path,
-                root,
-                path_to_id,
-                r.language,
-                ts_path_aliases,
-                ts_packages,
-            )
+            target_id = bound_language.resolve_import(imp, r.path)
             if target_id and target_id != node_id:
                 edge_key = (node_id, target_id, "IMPORTS")
                 if edge_key not in seen_edges:
@@ -2103,11 +638,8 @@ def build_graph(
             provider_id = _resolve_provider(
                 iface,
                 r,
-                root,
-                path_to_id,
+                bound_language,
                 provider_candidates,
-                ts_path_aliases,
-                ts_packages,
             )
             if provider_id and provider_id != node_id:
                 calls_api_targets.add(provider_id)
@@ -2119,11 +651,8 @@ def build_graph(
                 provider_id = _resolve_provider(
                     base_name,
                     r,
-                    root,
-                    path_to_id,
+                    bound_language,
                     provider_candidates,
-                    ts_path_aliases,
-                    ts_packages,
                 )
                 if provider_id and provider_id != node_id:
                     calls_api_targets.add(provider_id)
@@ -2141,15 +670,7 @@ def build_graph(
 
         # -- DATA_FLOWS_TO edges --
         for imp in r.imports:
-            target_id = resolve_import(
-                imp,
-                r.path,
-                root,
-                path_to_id,
-                r.language,
-                ts_path_aliases,
-                ts_packages,
-            )
+            target_id = bound_language.resolve_import(imp, r.path)
             if target_id and target_id != node_id:
                 target_r = id_to_result.get(target_id)
                 if target_r and target_r.has_validation:
@@ -2166,14 +687,9 @@ def build_graph(
         # -- entity-level REFERENCES edges --
         # For each imported name, link source_entity -> target_entity
         for imp_name in r.imported_names:
-            target_id = resolve_import(
+            target_id = bound_language.resolve_import(
                 imp_name["module"],
                 r.path,
-                root,
-                path_to_id,
-                r.language,
-                ts_path_aliases,
-                ts_packages,
             )
             if not target_id or target_id == node_id:
                 continue
@@ -2304,7 +820,10 @@ def build_graph(
     return Ok(GraphBuildOutput(nodes, edges))
 
 
-def _find_local_references(entities: list[dict], name: str) -> list[str]:
+def _find_local_references(
+    entities: Sequence[EntityPayload],
+    name: str,
+) -> list[str]:
     """
     Heuristic: check which local entities might reference the imported name.
     If a class extends/implements the name, or has it in bases, it references it.
@@ -2641,81 +1160,63 @@ class LspClient:
 # ---------------------------------------------------------------------------
 
 def discover_projects(root: str, file_results: list[FileResult]) -> list[ProjectGroup]:
-    """
-    Group files by LSP project root, detected by presence of config files.
+    """Group source files by the closest language-owned project config."""
+    configs_by_language: dict[str, list[str]] = {
+        language.name: [] for language in LANGUAGES
+    }
+    config_owners = {
+        config_name: language.name
+        for language in LANGUAGES
+        for config_name in language.project_config_names
+    }
 
-    For TypeScript: looks for tsconfig.json.
-    For Python: looks for pyrightconfig.json or pyproject.toml.
-
-    Files that do not belong to any detected project are skipped.
-    """
-    # Find all config files
-    ts_configs: list[str] = []
-    py_configs: list[str] = []
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Skip unwanted directories
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for fname in filenames:
-            full = os.path.join(dirpath, fname)
-            if fname == "tsconfig.json":
-                ts_configs.append(full)
-            elif fname in ("pyrightconfig.json", "pyproject.toml"):
-                py_configs.append(full)
-
-    # Sort configs by depth (deepest first) so files match the most specific project
-    ts_configs.sort(key=lambda p: -p.count(os.sep))
-    py_configs.sort(key=lambda p: -p.count(os.sep))
+    for directory_path, directory_names, file_names in os.walk(root):
+        directory_names[:] = [
+            name for name in directory_names if name not in SKIP_DIRS
+        ]
+        for file_name in file_names:
+            owner_name = config_owners.get(file_name)
+            if owner_name is not None:
+                configs_by_language[owner_name].append(
+                    os.path.join(directory_path, file_name)
+                )
 
     projects: list[ProjectGroup] = []
     assigned_files: set[str] = set()
-
-    # Assign TypeScript files to projects
-    for config in ts_configs:
-        proj_root = os.path.dirname(config)
-        proj = ProjectGroup(
-            root=proj_root,
-            language="typescript",
-            config_file=config,
+    for language in LANGUAGES:
+        configs = sorted(
+            configs_by_language[language.name],
+            key=lambda path: -path.count(os.sep),
         )
-        for r in file_results:
-            if r.language == "typescript" and r.path not in assigned_files:
-                if r.path.startswith(proj_root + os.sep):
-                    proj.files.append(r)
-                    assigned_files.add(r.path)
-        if proj.files:
-            projects.append(proj)
-
-    # Assign Python files to projects
-    for config in py_configs:
-        proj_root = os.path.dirname(config)
-        proj = ProjectGroup(
-            root=proj_root,
-            language="python",
-            config_file=config,
-        )
-        for r in file_results:
-            if r.language == "python" and r.path not in assigned_files:
-                if r.path.startswith(proj_root + os.sep):
-                    proj.files.append(r)
-                    assigned_files.add(r.path)
-        if proj.files:
-            projects.append(proj)
+        for config_path in configs:
+            project_root = os.path.dirname(config_path)
+            project = ProjectGroup(
+                root=project_root,
+                language=language.name,
+                config_file=config_path,
+            )
+            for result in file_results:
+                if (
+                    result.language in language.lsp_result_languages
+                    and result.path not in assigned_files
+                    and result.path.startswith(project_root + os.sep)
+                ):
+                    project.files.append(result)
+                    assigned_files.add(result.path)
+            if project.files:
+                projects.append(project)
 
     return projects
+
+
+def _language_id(language: str, path: str) -> str:
+    """Map a parsed result language to its LSP languageId."""
+    return language_for_result(language).lsp_language_id(path)
 
 
 # ---------------------------------------------------------------------------
 # LSP analysis -- call hierarchy + references
 # ---------------------------------------------------------------------------
-
-def _language_id(language: str, path: str) -> str:
-    """Map internal language + file extension to LSP languageId."""
-    if language == "python":
-        return "python"
-    if path.endswith(".tsx"):
-        return "typescriptreact"
-    return "typescript"
 
 
 # LSP SymbolKind constants
@@ -2760,7 +1261,9 @@ def _sym_line(sym: dict) -> int:
     return 0
 
 
-def _lsp_symbols_to_entities(symbols: list[dict]) -> tuple[list[dict], list[str]]:
+def _lsp_symbols_to_entities(
+    symbols: list[dict],
+) -> tuple[list[EntityPayload], list[str]]:
     """
     Convert LSP symbol results into Entity dicts and exported names.
 
@@ -2768,7 +1271,7 @@ def _lsp_symbols_to_entities(symbols: list[dict]) -> tuple[list[dict], list[str]
     (flat, has location) formats. Filters to top-level definitions only:
     classes, interfaces, functions, types, enums, and exported constants.
     """
-    entities: list[dict] = []
+    entities: list[EntityPayload] = []
     exported_names: list[str] = []
     seen_names: set[str] = set()
 
@@ -2793,7 +1296,7 @@ def _lsp_symbols_to_entities(symbols: list[dict]) -> tuple[list[dict], list[str]
 
 def _process_doc_symbol(
     sym: dict,
-    entities: list[dict],
+    entities: list[EntityPayload],
     exported_names: list[str],
     seen_names: set[str],
 ) -> None:
@@ -2868,7 +1371,7 @@ def _process_doc_symbol(
 
 def _process_symbol_info(
     sym: dict,
-    entities: list[dict],
+    entities: list[EntityPayload],
     exported_names: list[str],
     seen_names: set[str],
 ) -> None:
@@ -2894,7 +1397,7 @@ def _process_symbol_info(
 
 def _drain_prepare_batch(
     client: "LspClient",
-    batch: list[tuple[int, str, dict]],
+    batch: list[tuple[int, str, EntityPayload]],
     path_to_node_id: dict[str, str],
     source_node_id: str,
     lsp_edges: list[LspEdge],
@@ -2944,13 +1447,13 @@ def _drain_prepare_batch(
 
 
 def _partition_lsp_batch(
-    pending_prepare: list[tuple[int, str, dict]],
+    pending_prepare: list[tuple[int, str, EntityPayload]],
     pending_refs: list[tuple[int, str, str]],
     batch_size: int,
 ) -> tuple[
-    list[tuple[int, str, dict]],
+    list[tuple[int, str, EntityPayload]],
     list[tuple[int, str, str]],
-    list[tuple[int, str, dict]],
+    list[tuple[int, str, EntityPayload]],
     list[tuple[int, str, str]],
 ]:
     """Take a bounded mixed LSP batch while guaranteeing queue progress."""
@@ -3013,7 +1516,7 @@ def _drain_reference_batch(
 
 
 def _find_enclosing_entity(
-    entities: list[dict], line_0based: int,
+    entities: Sequence[EntityPayload], line_0based: int,
 ) -> Optional[str]:
     """
     Find the entity that encloses the given 0-based line.
@@ -3021,7 +1524,7 @@ def _find_enclosing_entity(
     Uses a simple heuristic: the entity whose line is closest to (but not
     after) the target line.
     """
-    best: Optional[dict] = None
+    best: Optional[EntityPayload] = None
     for ent in entities:
         ent_line_0 = ent["line"] - 1  # entity lines are 1-based
         if ent_line_0 <= line_0based:
@@ -3042,11 +1545,8 @@ def analyze_project_lsp(
 
     Returns a list of LspEdge instances to merge into the main graph.
     """
-    # Determine LSP server command
-    if project.language == "typescript":
-        cmd = ["typescript-language-server", "--stdio"]
-    else:
-        cmd = ["pyright-langserver", "--stdio"]
+    language = language_for_name(project.language)
+    cmd = list(language.lsp_command)
 
     # Check server availability
     server_bin = cmd[0]
@@ -3078,7 +1578,11 @@ def analyze_project_lsp(
                 uri = path_to_uri(r.path)
                 lang_id = _language_id(r.language, r.path)
                 client.did_open(uri, lang_id, content)
-            except OSError:
+            except OSError as error:
+                print(
+                    f"  [lsp] WARNING: could not open {r.path}: {error}",
+                    file=sys.stderr,
+                )
                 continue
 
         # Give the server a moment to process opened files
@@ -3103,8 +1607,9 @@ def analyze_project_lsp(
                 # Build regex method index: entity_name -> methods list
                 regex_methods: dict[str, list[str]] = {}
                 for old_ent in r.entities:
-                    if old_ent.get("methods"):
-                        regex_methods[old_ent["name"]] = old_ent["methods"]
+                    methods = old_ent.get("methods", [])
+                    if methods:
+                        regex_methods[old_ent["name"]] = methods
                 # Merge: carry over regex methods when LSP has none
                 for ent in new_entities:
                     if ent["kind"] in ("class", "interface") and not ent.get("methods"):
@@ -3116,9 +1621,12 @@ def analyze_project_lsp(
                         for old_ent in r.entities:
                             if old_ent["name"] == ent["name"]:
                                 if not ent.get("bases") and old_ent.get("bases"):
-                                    ent["bases"] = old_ent["bases"]
+                                    ent["bases"] = old_ent.get("bases", [])
                                 if not ent.get("decorators") and old_ent.get("decorators"):
-                                    ent["decorators"] = old_ent["decorators"]
+                                    ent["decorators"] = old_ent.get(
+                                        "decorators",
+                                        [],
+                                    )
                                 break
                 # Add regex entities not found by LSP (e.g., Zod schemas)
                 lsp_names = {e["name"] for e in new_entities}
@@ -3160,7 +1668,7 @@ def analyze_project_lsp(
             uri = path_to_uri(r.path)
 
             # -- Batch 1: fire prepareCallHierarchy + references for all entities --
-            pending_prepare: list[tuple[int, str, dict]] = []  # (msg_id, ent_name, ent)
+            pending_prepare: list[tuple[int, str, EntityPayload]] = []
             pending_refs: list[tuple[int, str, str]] = []  # (msg_id, ent_name, node_id)
 
             for ent in r.entities:
@@ -3298,13 +1806,7 @@ def enrich_with_lsp(
     edges: list[dict],
     request_timeout: float,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Run LSP analysis on all detected projects and merge edges into the graph.
-
-    For TypeScript: replaces regex-extracted entities with LSP documentSymbol
-    results, then queries call hierarchy and references for precise edges.
-    For Python: queries call hierarchy and references only (keeps AST entities).
-    """
+    """Run language-owned LSP analysis and merge its graph evidence."""
     # Build lookup tables
     path_to_node_id: dict[str, str] = {}
     node_id_to_result: dict[str, FileResult] = {}
@@ -3316,15 +1818,33 @@ def enrich_with_lsp(
     # Discover projects
     projects = discover_projects(root, results)
     if not projects:
-        print("[belief-map] No LSP-compatible projects found (no tsconfig.json or pyrightconfig.json)")
+        config_names = ", ".join(
+            sorted({
+                config_name
+                for language in LANGUAGES
+                for config_name in language.project_config_names
+            })
+        )
+        print(
+            "[belief-map] No LSP-compatible projects found "
+            f"(expected one of: {config_names})"
+        )
         return nodes, edges
 
-    ts_projects = [p for p in projects if p.language == "typescript"]
-    py_projects = [p for p in projects if p.language == "python"]
-    ts_files = sum(len(p.files) for p in ts_projects)
-    py_files = sum(len(p.files) for p in py_projects)
-    print(f"[belief-map] LSP: {len(projects)} projects "
-          f"({len(ts_projects)} TS/{ts_files} files, {len(py_projects)} Py/{py_files} files)")
+    language_stats: list[str] = []
+    for language in LANGUAGES:
+        language_projects = [
+            project for project in projects if project.language == language.name
+        ]
+        if language_projects:
+            file_count = sum(len(project.files) for project in language_projects)
+            language_stats.append(
+                f"{len(language_projects)} {language.lsp_label}/{file_count} files"
+            )
+    print(
+        f"[belief-map] LSP: {len(projects)} projects "
+        f"({', '.join(language_stats)})"
+    )
 
     all_lsp_edges: list[LspEdge] = []
 
@@ -3567,8 +2087,8 @@ def render_sexp(
     lines.append("; --- nodes ---")
     for node in sorted_nodes:
         sid = path_to_sid[node["id"]]
-        _LANG_SHORT = {"python": "py", "typescript": "ts", "tsx": "tsx", "jsx": "jsx", "javascript": "js"}
-        lang = _LANG_SHORT.get(node["language"], node["language"][:2])
+        language = language_for_result(node["language"])
+        lang = language.output_language_code(node["language"])
         purpose = _sexp_escape(node.get("purpose", ""))
         inv = node.get("invariant", {})
         naming = inv.get("naming", "mixed")
@@ -3781,14 +2301,27 @@ def _serialize_file_result(result: FileResult) -> dict:
 def _run_build(options: BuilderOptions) -> int:
     root = options.root
     t0 = time.monotonic()
-    mode = "LSP-enhanced" if options.use_lsp else "regex/AST"
+    mode = "LSP-enhanced" if options.use_lsp else "syntax"
     print(f"[belief-map] Scanning {root} ... (mode: {mode})")
 
     files = discover_files(root)
-    py_count = sum(1 for _, language, _ in files if language == "python")
-    ts_count = sum(1 for _, language, _ in files if language == "typescript")
-    print(f"[belief-map] Found {len(files)} source files ({py_count} py, {ts_count} ts)")
-    print("[belief-map] Supported source: .py, .ts, .tsx; other languages are excluded")
+    language_counts = {
+        language.name: sum(
+            1 for _, language_name, _ in files if language_name == language.name
+        )
+        for language in LANGUAGES
+    }
+    count_summary = ", ".join(
+        f"{language_counts[language.name]} {language.cli_label}"
+        for language in LANGUAGES
+    )
+    extensions = ", ".join(
+        extension
+        for language in LANGUAGES
+        for extension in language.source_extensions
+    )
+    print(f"[belief-map] Found {len(files)} source files ({count_summary})")
+    print(f"[belief-map] Supported source: {extensions}")
 
     cache = {} if options.full_rebuild else load_cache(root)
     to_parse: list[tuple[str, str, str]] = []
@@ -3816,9 +2349,7 @@ def _run_build(options: BuilderOptions) -> int:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(parse_file, item): item for item in to_parse}
             for fut in as_completed(futures):
-                result = fut.result()
-                if result:
-                    new_results.append(result)
+                new_results.append(fut.result())
 
     all_results = sorted(
         cached_results + new_results,
@@ -3841,8 +2372,11 @@ def _run_build(options: BuilderOptions) -> int:
     nodes = graph_result.value.nodes
     edges = graph_result.value.edges
 
-    t_regex = time.monotonic() - t0
-    print(f"[belief-map] Regex/AST pass: {t_regex:.2f}s -- {len(nodes)} nodes, {len(edges)} edges")
+    syntax_elapsed = time.monotonic() - t0
+    print(
+        f"[belief-map] Syntax pass: {syntax_elapsed:.2f}s -- "
+        f"{len(nodes)} nodes, {len(edges)} edges"
+    )
 
     # LSP enrichment pass (if requested)
     if options.use_lsp:
