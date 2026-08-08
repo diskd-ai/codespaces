@@ -1,5 +1,8 @@
 # Codespaces - Code Search, Dependency Graphs, and Impact Analysis
 
+> Architecture-aware code search, dependency graphs, and impact analysis for
+> Python, TypeScript, Rust, C#, Java, Go, Ruby, Rails, for AI coding agents.
+>
 > **Install:** `npx skills add diskd-ai/codespaces` | [skills.sh](https://skills.sh)
 >
 > **Release notes:** [Changelog](CHANGELOG.md)

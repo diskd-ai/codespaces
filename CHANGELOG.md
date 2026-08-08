@@ -4,6 +4,8 @@
 
 ### Changes
 
+- Corrected the README and GitHub description to present AI coding agents as
+  the audience rather than another supported language.
 - Added dynamically loaded Ruby and Ruby on Rails indexing for `.rb` and
   `.rake` files, including classes, modules, instance and singleton methods,
   inheritance, explicit requires, and Ruby LSP metadata.
