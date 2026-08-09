@@ -114,6 +114,14 @@ def _package_entrypoints(package: RustPackage) -> tuple[str, ...]:
     )
 
 
+def _logical_module_files(module_directory: str) -> tuple[str, ...]:
+    """Return the physical Rust files that can define one logical module."""
+    return (
+        f"{module_directory}.rs",
+        os.path.join(module_directory, "mod.rs"),
+    )
+
+
 def _owning_package(
     source_path: str,
     packages: tuple[RustPackage, ...],
@@ -196,15 +204,27 @@ class BoundRustLanguage:
         if first in ("self", "super"):
             module_directory = _logical_module_directory(absolute_source)
             index = 0
+            traversed_parent = False
             while index < len(segments) and segments[index] in ("self", "super"):
                 if segments[index] == "super":
                     module_directory = os.path.dirname(module_directory)
+                    traversed_parent = True
                 index += 1
+            remaining_segments = segments[index:]
+            fallbacks: tuple[str, ...] = ()
+            if not remaining_segments:
+                if traversed_parent:
+                    fallbacks = _logical_module_files(module_directory)
+                    crate_source = _crate_source_directory(absolute_source, owner)
+                    if module_directory == crate_source and owner is not None:
+                        fallbacks = (*fallbacks, *_package_entrypoints(owner))
+                else:
+                    fallbacks = (absolute_source,)
             return _resolve_from_directory(
                 module_directory,
-                segments[index:],
+                remaining_segments,
                 self.path_to_id,
-                (absolute_source,),
+                fallbacks,
             )
 
         package = next(

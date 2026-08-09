@@ -132,6 +132,47 @@ pub fn execute() {}
             imports,
         )
 
+    def test_graph_resolves_bare_super_glob_to_parent_module(self) -> None:
+        """/* REQ-RUST-004: A bare super glob preserves the child-to-parent module dependency. */"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "app"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            results = [
+                self._parse(
+                    root,
+                    "src/lib.rs",
+                    "mod handlers;\npub struct RootState;\n",
+                ),
+                self._parse(
+                    root,
+                    "src/handlers.rs",
+                    "use super::*;\npub mod payments;\npub struct AppState;\n",
+                ),
+                self._parse(
+                    root,
+                    "src/handlers/payments.rs",
+                    "use super::*;\npub fn process(_: AppState) {}\n",
+                ),
+            ]
+
+            graph_result = build_graph(results, str(root))
+            if not isinstance(graph_result, Ok):
+                self.fail(f"Rust graph build failed: {graph_result.error}")
+            imports = {
+                (edge["source"], edge["target"])
+                for edge in graph_result.value.edges
+                if edge["type"] == "IMPORTS"
+            }
+
+        self.assertIn(
+            ("src/handlers/payments", "src/handlers"),
+            imports,
+        )
+        self.assertIn(("src/handlers", "src/lib"), imports)
+
     def test_rust_language_metadata_matches_rust_analyzer(self) -> None:
         """/* REQ-RUST-003: Rust registration exposes canonical module, output, and LSP metadata. */"""
         self.assertEqual(

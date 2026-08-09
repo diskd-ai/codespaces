@@ -10,6 +10,10 @@
 
 ### Fixes
 
+- Resolved Rust module IDs to physical `.rs` or nested `mod.rs` files in
+  source-aware search output.
+- Preserved conservative dependency edges from bare `use super::*` imports to
+  their parent module, including crate-root parents.
 - Rejected path-shaped `--exclude-dir` values consistently across POSIX and
   Windows syntax.
 - Applied caller exclusions to TypeScript alias discovery instead of retaining
