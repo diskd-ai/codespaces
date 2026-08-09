@@ -65,6 +65,16 @@ Build an architecture map for an explicit project directory:
 python3 scripts/build_belief_map.py --root /absolute/path/to/project
 ```
 
+Exclude tracked source snapshots or generated fixture trees by directory name.
+The option is repeatable and applies at any depth:
+
+```bash
+python3 scripts/build_belief_map.py \
+  --root /absolute/path/to/project \
+  --exclude-dir review-bundles \
+  --exclude-dir generated-fixtures
+```
+
 Parser packages are loaded only for languages found in that project. Python
 needs no extra parser package. If another detected language is not installed,
 the builder stops before publishing and prints its exact install command, for

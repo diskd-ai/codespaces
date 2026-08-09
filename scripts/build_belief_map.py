@@ -271,7 +271,10 @@ def detect_source_language(filename: str) -> Optional[str]:
     return language.name if language is not None else None
 
 
-def discover_files(root: str) -> list[tuple[str, str, str]]:
+def discover_files(
+    root: str,
+    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+) -> list[tuple[str, str, str]]:
     results: list[tuple[str, str, str]] = []
     root_path = Path(root).resolve()
 
@@ -279,7 +282,7 @@ def discover_files(root: str) -> list[tuple[str, str, str]]:
         try:
             with os.scandir(dir_path) as it:
                 for entry in it:
-                    if entry.name in SKIP_DIRS:
+                    if entry.name in skip_directories:
                         continue
                     if entry.is_dir(follow_symlinks=False):
                         child_repo = repo
@@ -368,7 +371,10 @@ def _report_dependency_issues(
     )
 
 
-def _builder_fingerprint(language_names: frozenset[str]) -> str:
+def _builder_fingerprint(
+    language_names: frozenset[str],
+    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+) -> str:
     """Fingerprint active parsers, dependencies, and shared configuration."""
     active_languages = _active_languages(language_names)
     dependency_packages = sorted({
@@ -385,7 +391,7 @@ def _builder_fingerprint(language_names: frozenset[str]) -> str:
             BUILDER_CONFIG_VERSION,
             ",".join(sorted(language_names)),
             dependency_versions,
-            ",".join(sorted(SKIP_DIRS)),
+            ",".join(sorted(skip_directories)),
         )
     )
     digest = hashlib.sha256()
@@ -436,7 +442,11 @@ def _atomic_write_text(path: str, content: str) -> None:
         raise
 
 
-def load_cache(root: str, language_names: frozenset[str]) -> dict:
+def load_cache(
+    root: str,
+    language_names: frozenset[str],
+    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+) -> dict:
     """Load compatible cache entries or rebuild with an explicit warning."""
     cache_path = os.path.join(root, CACHE_FILE)
     if not os.path.exists(cache_path):
@@ -459,7 +469,10 @@ def load_cache(root: str, language_names: frozenset[str]) -> dict:
             file=sys.stderr,
         )
         return {}
-    expected_fingerprint = _builder_fingerprint(language_names)
+    expected_fingerprint = _builder_fingerprint(
+        language_names,
+        skip_directories,
+    )
     if (
         cache.get("schema_version") != CACHE_SCHEMA_VERSION
         or cache.get("builder_fingerprint") != expected_fingerprint
@@ -481,11 +494,15 @@ def save_cache(
     root: str,
     entries: dict,
     language_names: frozenset[str],
+    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
 ) -> None:
     cache_path = os.path.join(root, CACHE_FILE)
     cache = {
         "schema_version": CACHE_SCHEMA_VERSION,
-        "builder_fingerprint": _builder_fingerprint(language_names),
+        "builder_fingerprint": _builder_fingerprint(
+            language_names,
+            skip_directories,
+        ),
         "entries": entries,
     }
     serialized = json.dumps(cache, sort_keys=True, separators=(",", ":")) + "\n"
@@ -642,7 +659,9 @@ def _resolve_target_entity(
 
 
 def build_graph(
-    results: list[FileResult], root: str,
+    results: list[FileResult],
+    root: str,
+    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
 ) -> Result[GraphBuildOutput, GraphBuildError]:
     index_result = _build_node_indexes(results, root)
     if isinstance(index_result, Err):
@@ -651,7 +670,7 @@ def build_graph(
 
     result_languages = {result.language for result in results}
     bound_languages = {
-        language.name: language.bind(root, path_to_id, frozenset(SKIP_DIRS))
+        language.name: language.bind(root, path_to_id, skip_directories)
         for language in LANGUAGES
         if result_languages.intersection(language.result_languages)
     }
@@ -1314,14 +1333,18 @@ class LspClient:
 # Project discovery for LSP
 # ---------------------------------------------------------------------------
 
-def discover_projects(root: str, file_results: list[FileResult]) -> list[ProjectGroup]:
+def discover_projects(
+    root: str,
+    file_results: list[FileResult],
+    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+) -> list[ProjectGroup]:
     """Group source files by the closest language-owned project config."""
     configs_by_language: dict[str, list[str]] = {
         language.name: [] for language in LANGUAGES
     }
     for directory_path, directory_names, file_names in os.walk(root):
         directory_names[:] = [
-            name for name in directory_names if name not in SKIP_DIRS
+            name for name in directory_names if name not in skip_directories
         ]
         for file_name in file_names:
             for language in LANGUAGES:
@@ -1954,6 +1977,7 @@ def enrich_with_lsp(
     nodes: list[dict],
     edges: list[dict],
     request_timeout: float,
+    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
 ) -> tuple[list[dict], list[dict]]:
     """Run language-owned LSP analysis and merge its graph evidence."""
     # Build lookup tables
@@ -1965,7 +1989,7 @@ def enrich_with_lsp(
         node_id_to_result[nid] = r
 
     # Discover projects
-    projects = discover_projects(root, results)
+    projects = discover_projects(root, results, skip_directories)
     if not projects:
         config_names = ", ".join(
             sorted({
@@ -2354,13 +2378,14 @@ class BuilderOptions:
     full_rebuild: bool
     use_lsp: bool
     lsp_timeout: float
+    skip_directories: frozenset[str]
 
 
 def _builder_usage() -> str:
     return (
         "usage: build_belief_map.py --root ABSOLUTE_PATH "
         "[--output ABSOLUTE_PATH] [--full] [--lsp] "
-        "[--lsp-timeout SECONDS]"
+        "[--lsp-timeout SECONDS] [--exclude-dir NAME ...]"
     )
 
 
@@ -2371,11 +2396,12 @@ def parse_builder_options(args: list[str]) -> Result[BuilderOptions, str]:
     full_rebuild = False
     use_lsp = False
     lsp_timeout = LSP_REQUEST_TIMEOUT
+    excluded_directories: set[str] = set()
 
     index = 0
     while index < len(args):
         argument = args[index]
-        if argument in ("--root", "--output", "--lsp-timeout"):
+        if argument in ("--root", "--output", "--lsp-timeout", "--exclude-dir"):
             if index + 1 >= len(args):
                 return Err(f"{argument} requires a value")
             value = args[index + 1]
@@ -2383,6 +2409,21 @@ def parse_builder_options(args: list[str]) -> Result[BuilderOptions, str]:
                 root_argument = value
             elif argument == "--output":
                 output_argument = value
+            elif argument == "--exclude-dir":
+                if (
+                    not value
+                    or value in (".", "..")
+                    or os.path.basename(value) != value
+                    or (
+                        os.path.altsep is not None
+                        and os.path.altsep in value
+                    )
+                ):
+                    return Err(
+                        "--exclude-dir must be a directory name, not a path: "
+                        f"{value}"
+                    )
+                excluded_directories.add(value)
             else:
                 try:
                     lsp_timeout = float(value)
@@ -2425,6 +2466,7 @@ def parse_builder_options(args: list[str]) -> Result[BuilderOptions, str]:
         full_rebuild=full_rebuild,
         use_lsp=use_lsp,
         lsp_timeout=lsp_timeout,
+        skip_directories=frozenset(SKIP_DIRS | excluded_directories),
     ))
 
 
@@ -2464,7 +2506,7 @@ def _run_build(options: BuilderOptions) -> int:
     mode = "LSP-enhanced" if options.use_lsp else "syntax"
     print(f"[belief-map] Scanning {root} ... (mode: {mode})")
 
-    files = discover_files(root)
+    files = discover_files(root, options.skip_directories)
     language_counts = {
         language.name: sum(
             1 for _, language_name, _ in files if language_name == language.name
@@ -2494,7 +2536,7 @@ def _run_build(options: BuilderOptions) -> int:
     cache = (
         {}
         if options.full_rebuild
-        else load_cache(root, active_language_names)
+        else load_cache(root, active_language_names, options.skip_directories)
     )
     to_parse: list[tuple[str, str, str]] = []
     cached_results: list[FileResult] = []
@@ -2527,7 +2569,7 @@ def _run_build(options: BuilderOptions) -> int:
         cached_results + new_results,
         key=lambda result: os.path.relpath(result.path, root).replace(os.sep, "/"),
     )
-    graph_result = build_graph(all_results, root)
+    graph_result = build_graph(all_results, root, options.skip_directories)
     if isinstance(graph_result, Err):
         for collision in graph_result.error.collisions:
             paths = ", ".join(collision.paths)
@@ -2563,6 +2605,7 @@ def _run_build(options: BuilderOptions) -> int:
             nodes,
             edges,
             options.lsp_timeout,
+            options.skip_directories,
         )
         t_lsp = time.monotonic() - t_lsp_start
         print(f"[belief-map] LSP pass: {t_lsp:.2f}s")
@@ -2572,7 +2615,12 @@ def _run_build(options: BuilderOptions) -> int:
         for result in all_results
     }
     map_content = render_sexp(nodes, edges, root, mode, len(all_results))
-    save_cache(root, new_cache, active_language_names)
+    save_cache(
+        root,
+        new_cache,
+        active_language_names,
+        options.skip_directories,
+    )
     _atomic_write_text(options.output_path, map_content)
 
     elapsed = time.monotonic() - t0

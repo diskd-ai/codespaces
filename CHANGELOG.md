@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-08-09
+
+### Changes
+
+- Added repeatable `--exclude-dir NAME` options so callers can omit tracked
+  source snapshots, generated fixtures, and similar non-product trees from
+  source, package, project, and LSP discovery.
+- Included caller-provided directory exclusions in cache provenance so changing
+  the active exclusion set forces a safe rebuild.
+
 ## 2026-08-08
 
 ### Changes
