@@ -116,6 +116,37 @@ class DynamicDependencyTests(unittest.TestCase):
             self.assertFalse((target / ".belief_map.sexp").exists())
             self.assertFalse((target / ".belief_map_cache.json").exists())
 
+    def test_pascal_only_build_needs_no_parser_packages(self) -> None:
+        """/* REQ-DEPS-005: Pascal indexing remains dependency-free when optional parser packages are absent. */"""
+        repository_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "worker.pas").write_text(
+                "unit worker; interface procedure Execute; "
+                "implementation procedure Execute; begin end; end.\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    "-B",
+                    str(repository_root / "scripts" / "build_belief_map.py"),
+                    "--root",
+                    str(target),
+                ],
+                cwd=repository_root,
+                capture_output=True,
+                check=False,
+                env=self._without_pythonpath(),
+                text=True,
+            )
+
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertIn("1 pas", completed.stdout)
+            self.assertTrue((target / ".belief_map.sexp").is_file())
+
     def test_language_requirement_files_match_registry_contracts(self) -> None:
         """/* REQ-DEPS-003: Per-language install files exactly match the parser versions declared by each adapter. */"""
         repository_root = Path(__file__).resolve().parents[1]

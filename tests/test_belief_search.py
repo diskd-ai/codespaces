@@ -218,6 +218,71 @@ class BeliefSearchAliasTest(unittest.TestCase):
                 analyze_output.getvalue(),
             )
 
+    def test_module_paths_resolve_free_pascal_sources_and_includes(self) -> None:
+        """/* REQ-PAS-007: Search results return real Pascal source paths for every supported extension. */"""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        root = Path(tmpdir.name).resolve()
+        expected = {
+            "soft/ipKernel": root / "soft/ipKernel.lpr",
+            "soft/uWorker": root / "soft/uWorker.pas",
+            "shared/common": root / "shared/common.pp",
+            "shared/constants.inc": root / "shared/constants.inc",
+        }
+        for path in expected.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+
+        sexp_path = root / ".belief_map.sexp"
+        sexp_path.write_text(
+            textwrap.dedent(
+                """
+                (belief-map :schema 1 :files 4 :nodes 4 :edges 0 :violations 0)
+                (paths
+                  (soft
+                    (p1 ipKernel)
+                    (p2 uWorker)
+                  )
+                  (shared
+                    (p3 common)
+                    (p4 constants.inc)
+                  )
+                )
+                (node p1 pas application)
+                (node p2 pas service)
+                (node p3 pas shared)
+                (node p4 pas shared)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        graph = belief_search.BeliefGraph()
+        load_result = graph.load(str(sexp_path), str(root))
+        self.assertIsInstance(load_result, belief_search.MapLoadOk)
+
+        for module_id, path in expected.items():
+            with self.subTest(module_id=module_id):
+                self.assertEqual(
+                    str(path),
+                    belief_search._module_id_to_file(module_id, str(root)),
+                )
+                boundary_output = io.StringIO()
+                with redirect_stdout(boundary_output):
+                    belief_search.cmd_boundary(graph, module_id, files_only=True)
+                self.assertEqual(
+                    [str(path)],
+                    boundary_output.getvalue().strip().splitlines(),
+                )
+
+                analyze_output = io.StringIO()
+                with redirect_stdout(analyze_output):
+                    belief_search.cmd_analyze(graph, module_id)
+                self.assertIn(
+                    f"(boundary-file {module_id} {path})",
+                    analyze_output.getvalue(),
+                )
+
     def test_no_match_includes_suggestions(self) -> None:
         """/* REQ-CS-006: no-match errors must surface actionable module suggestions. */"""
         graph, _sexp_path = self._load_graph()
