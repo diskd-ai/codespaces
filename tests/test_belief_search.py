@@ -144,6 +144,80 @@ class BeliefSearchAliasTest(unittest.TestCase):
             ],
         )
 
+    def test_rust_query_commands_resolve_physical_source_files(self) -> None:
+        """/* REQ-CS-033: Rust query boundaries resolve to physical source paths. */"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flat_module = root / "src" / "handlers.rs"
+            child_module = root / "src" / "handlers" / "payments.rs"
+            nested_module = root / "src" / "storage" / "mod.rs"
+            flat_module.parent.mkdir(parents=True)
+            child_module.parent.mkdir(parents=True)
+            nested_module.parent.mkdir(parents=True)
+            flat_module.write_text("pub mod payments;\n", encoding="utf-8")
+            child_module.write_text("use super::*;\n", encoding="utf-8")
+            nested_module.write_text("pub struct Database;\n", encoding="utf-8")
+            sexp_path = root / ".belief_map.sexp"
+            sexp_path.write_text(
+                textwrap.dedent(
+                    """
+                    (belief-map :schema 1 :files 3 :nodes 3 :edges 1 :violations 0)
+                    (paths
+                      (src
+                        (r1 handlers)
+                        (r3 storage)
+                        (handlers
+                          (r2 payments)
+                        )
+                      )
+                    )
+                    (node r1 rs service)
+                    (node r2 rs service)
+                    (node r3 rs shared)
+                    (imports r2 r1)
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            graph = belief_search.BeliefGraph()
+            load_result = graph.load(str(sexp_path), str(root))
+            self.assertIsInstance(load_result, belief_search.MapLoadOk)
+
+            self.assertEqual(
+                str(flat_module),
+                belief_search._module_id_to_file("src/handlers", str(root)),
+            )
+            self.assertEqual(
+                str(nested_module),
+                belief_search._module_id_to_file("src/storage", str(root)),
+            )
+
+            boundary_output = io.StringIO()
+            with redirect_stdout(boundary_output):
+                belief_search.cmd_boundary(
+                    graph,
+                    "src/handlers/payments",
+                    files_only=True,
+                )
+            self.assertEqual(
+                boundary_output.getvalue().strip().splitlines(),
+                [str(child_module), str(flat_module)],
+            )
+
+            analyze_output = io.StringIO()
+            with redirect_stdout(analyze_output):
+                belief_search.cmd_analyze(graph, "src/handlers/payments")
+            self.assertIn(
+                f"(boundary-file src/handlers/payments {child_module})",
+                analyze_output.getvalue(),
+            )
+            self.assertIn(
+                f"(boundary-file src/handlers/payments {flat_module})",
+                analyze_output.getvalue(),
+            )
+
     def test_no_match_includes_suggestions(self) -> None:
         """/* REQ-CS-006: no-match errors must surface actionable module suggestions. */"""
         graph, _sexp_path = self._load_graph()
