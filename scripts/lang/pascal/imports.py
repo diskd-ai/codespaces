@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -59,7 +60,11 @@ class BoundPascalLanguage:
                 names.setdefault(Path(path).stem.casefold(), set()).add(node_id)
             try:
                 content = Path(path).read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            except OSError as error:
+                print(
+                    f"[belief-map] Cannot index Pascal declarations from {path}: {error}",
+                    file=sys.stderr,
+                )
                 continue
             declared_name = extract_pascal_module_name(content)
             if declared_name and suffix != ".inc":

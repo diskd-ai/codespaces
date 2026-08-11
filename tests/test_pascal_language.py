@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.build_belief_map import Ok, build_graph, discover_files
 from scripts.lang.interface import FileResult
@@ -290,6 +293,32 @@ end.
             any(edge["type"] == "IMPORTS" for edge in graph_result.value.edges)
         )
 
+    def test_resolver_read_failures_are_reported(self) -> None:
+        """/* REQ-PAS-019: Resolver source-read failures emit an actionable diagnostic. */"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._parse(
+                root,
+                "src/Broken.pas",
+                "unit Broken; interface implementation end.\n",
+            )
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    Path,
+                    "read_text",
+                    side_effect=OSError("unreadable"),
+                ),
+                redirect_stderr(stderr),
+            ):
+                graph_result = build_graph([source], str(root))
+
+        self.assertIsInstance(graph_result, Ok)
+        self.assertIn(
+            f"[belief-map] Cannot index Pascal declarations from {source.path}: unreadable",
+            stderr.getvalue(),
+        )
+
     def test_procedural_type_parameters_do_not_end_the_type_section(self) -> None:
         """/* REQ-PAS-009: const/var parameters in procedural types preserve following declarations. */"""
         with tempfile.TemporaryDirectory() as directory:
@@ -541,7 +570,7 @@ end.
     def test_discovery_ignores_only_pascal_sources_in_lazarus_backup_dirs(self) -> None:
         """/* REQ-PAS-016: Lazarus backup copies are excluded without hiding other languages. */"""
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             live = root / "soft/live.pas"
             pascal_backup = root / "soft/backup/live.pas"
             python_backup = root / "soft/backup/helper.py"

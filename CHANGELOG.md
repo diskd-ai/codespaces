@@ -4,6 +4,8 @@
 
 ### Changes
 
+- Added dependency-free Free Pascal and Lazarus indexing for units, programs,
+  imports, includes, types, inheritance, methods, and routines.
 - Applied repository Git ignore rules to source, language configuration,
   package, and LSP project discovery, including tracked paths matched by
   `.gitignore`.
