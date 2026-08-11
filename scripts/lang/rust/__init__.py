@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult, LanguageDependency
+from ..interface import (
+    BoundLanguage,
+    DiscoveryExclusions,
+    FileResult,
+    LanguageDependency,
+)
 from .imports import BoundRustLanguage
 
 
@@ -53,9 +58,9 @@ class RustLanguage:
         self,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundLanguage:
-        return BoundRustLanguage.create(root, path_to_id, skip_directories)
+        return BoundRustLanguage.create(root, path_to_id, discovery_exclusions)
 
     def normalize_module_id(self, relative_path: str) -> str:
         if not relative_path.endswith(".rs"):

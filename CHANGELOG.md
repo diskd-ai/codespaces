@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-08-11
+
+### Changes
+
+- Applied repository Git ignore rules to source, language configuration,
+  package, and LSP project discovery, including tracked paths matched by
+  `.gitignore`.
+
+### Fixes
+
+- Rejected path-shaped `--exclude-dir` values consistently across POSIX and
+  Windows syntax.
+- Applied caller exclusions to TypeScript alias discovery instead of retaining
+  a separate internal directory list.
+
 ## 2026-08-09
 
 ### Changes

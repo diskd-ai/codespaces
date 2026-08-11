@@ -260,54 +260,6 @@ class IssueOneRegressionTest(unittest.TestCase):
         self.assertIsInstance(load_result, belief_search.MapLoadOk)
         self.assertIn("source", graph.nodes)
 
-    def test_builder_excludes_named_directories_and_invalidates_cache(self) -> None:
-        """/* REQ-CS-034: Caller exclusions apply to discovery and cache provenance. */"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            (root / "source.py").write_text("VALUE = 1\n", encoding="utf-8")
-            snapshot = root / "review-bundles" / "snapshot.py"
-            snapshot.parent.mkdir()
-            snapshot.write_text("STALE = True\n", encoding="utf-8")
-            command = [
-                sys.executable,
-                str(BUILD_SCRIPT),
-                "--root",
-                str(root),
-            ]
-
-            excluded = subprocess.run(
-                [*command, "--exclude-dir", "review-bundles"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            excluded_map = (root / ".belief_map.sexp").read_text(
-                encoding="utf-8"
-            )
-            included = subprocess.run(
-                command,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            included_map = (root / ".belief_map.sexp").read_text(
-                encoding="utf-8"
-            )
-            invalid = subprocess.run(
-                [*command, "--exclude-dir", "nested/review-bundles"],
-                capture_output=True,
-                text=True,
-            )
-
-        self.assertIn("Found 1 source files", excluded.stdout)
-        self.assertIn("source", excluded_map)
-        self.assertNotIn("review-bundles", excluded_map)
-        self.assertIn("schema or builder fingerprint changed", included.stderr)
-        self.assertIn("Found 2 source files", included.stdout)
-        self.assertIn("review-bundles", included_map)
-        self.assertEqual(2, invalid.returncode)
-        self.assertIn("--exclude-dir must be a directory name", invalid.stderr)
-
     def test_additional_literal_typescript_dependency_forms_create_edges(self) -> None:
         """/* REQ-CS-027: import-equals and literal templates must create edges. */"""
         with tempfile.TemporaryDirectory() as tmpdir:

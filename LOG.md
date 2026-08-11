@@ -1,5 +1,27 @@
 # Completion Log
 
+## 2026-08-11
+
+### Changes
+- Added one immutable discovery-exclusion contract shared by source,
+  language-configuration, package, and LSP project discovery.
+- Added repository-owned `.gitignore` resolution through Git with tracked-path
+  matching and machine-global ignore rules disabled.
+- Added focused issue #7 regression coverage for repeatable CLI basenames,
+  cross-platform validation, TypeScript configuration, language package
+  discovery, tracked ignored snapshots, and cache provenance.
+
+### Fixes
+- Removed TypeScript alias discovery's private skip list so it consumes the
+  same policy as every other target-root walk.
+- Prevented POSIX and Windows path forms from entering the basename-only public
+  CLI contract.
+
+### Motivation
+- Keep tracked snapshots and repository-ignored source-shaped artifacts out of
+  search, reverse-dependency, and architecture-violation results without
+  duplicating Git ignore semantics.
+
 ## 2026-08-08
 
 ### Changes

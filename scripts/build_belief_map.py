@@ -103,7 +103,7 @@ import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Generic, Optional, Sequence, TypeVar
 from urllib.parse import quote, unquote
 
@@ -112,6 +112,7 @@ try:
         from .lang import (
             LANGUAGES,
             BoundLanguage,
+            DiscoveryExclusions,
             FileResult,
             Language,
             language_for_file,
@@ -119,13 +120,19 @@ try:
             language_for_result,
         )
         from .lang.purpose import infer_purpose
+        from .lang.discovery import is_excluded_directory, is_excluded_path
         from .lang.interface import EntityPayload
         from .lang.source import file_hash
+        from .git_ignore import (
+            GitIgnoreUnavailable,
+            load_git_ignored_paths,
+        )
     else:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from lang import (
             LANGUAGES,
             BoundLanguage,
+            DiscoveryExclusions,
             FileResult,
             Language,
             language_for_file,
@@ -133,8 +140,13 @@ try:
             language_for_result,
         )
         from lang.purpose import infer_purpose
+        from lang.discovery import is_excluded_directory, is_excluded_path
         from lang.interface import EntityPayload
         from lang.source import file_hash
+        from git_ignore import (
+            GitIgnoreUnavailable,
+            load_git_ignored_paths,
+        )
 except ModuleNotFoundError as dependency_error:
     print(
         f"Error: missing Python dependency {dependency_error.name}. "
@@ -149,11 +161,33 @@ except ModuleNotFoundError as dependency_error:
 # ---------------------------------------------------------------------------
 
 SKIP_DIRS = {
-    "node_modules", ".venv", "venv", "__pycache__", ".git", "dist",
-    ".next", ".turbo", "bin", "build", "obj", "coverage", ".tox", "site-packages",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache", "target", "vendor",
-    ".worktrees", ".ralphy-worktrees", ".ralphy-sandboxes",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".git",
+    "dist",
+    ".next",
+    ".turbo",
+    "bin",
+    "build",
+    "obj",
+    "coverage",
+    ".tox",
+    "site-packages",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "target",
+    "vendor",
+    ".worktrees",
+    ".ralphy-worktrees",
+    ".ralphy-sandboxes",
 }
+DEFAULT_DISCOVERY_EXCLUSIONS = DiscoveryExclusions(
+    directory_names=frozenset(SKIP_DIRS),
+    paths=frozenset(),
+)
 
 CACHE_FILE = ".belief_map_cache.json"
 OUTPUT_FILE = ".belief_map.sexp"
@@ -207,24 +241,27 @@ class GraphBuildOutput:
 @dataclass
 class LspEdge:
     """An edge discovered by LSP analysis."""
-    source: str       # "node_id::entity_name" or "node_id"
-    target: str       # "node_id::entity_name" or "node_id"
-    edge_type: str    # "CALLS", "REFERENCES"
+
+    source: str  # "node_id::entity_name" or "node_id"
+    target: str  # "node_id::entity_name" or "node_id"
+    edge_type: str  # "CALLS", "REFERENCES"
     metadata: dict = field(default_factory=dict)
 
 
 @dataclass
 class ProjectGroup:
     """A group of files belonging to the same LSP project."""
-    root: str              # absolute path to project root
-    language: str          # language adapter name
-    config_file: str       # language-owned project configuration
+
+    root: str  # absolute path to project root
+    language: str  # language adapter name
+    config_file: str  # language-owned project configuration
     files: list[FileResult] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def path_to_uri(path: str) -> str:
     """Convert an absolute file path to a file:// URI."""
@@ -253,6 +290,7 @@ def find_entity_column(content: str, entity_name: str, line_1based: int) -> int:
 # Worker
 # ---------------------------------------------------------------------------
 
+
 def parse_file(args: tuple[str, str, str]) -> FileResult:
     path, language_name, repo = args
     mtime = os.path.getmtime(path)
@@ -265,6 +303,7 @@ def parse_file(args: tuple[str, str, str]) -> FileResult:
 # File discovery
 # ---------------------------------------------------------------------------
 
+
 def detect_source_language(filename: str) -> Optional[str]:
     """Return the supported parser language for a source filename."""
     language = language_for_file(filename)
@@ -273,7 +312,7 @@ def detect_source_language(filename: str) -> Optional[str]:
 
 def discover_files(
     root: str,
-    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+    exclusions: DiscoveryExclusions = DEFAULT_DISCOVERY_EXCLUSIONS,
 ) -> list[tuple[str, str, str]]:
     results: list[tuple[str, str, str]] = []
     root_path = Path(root).resolve()
@@ -282,19 +321,27 @@ def discover_files(
         try:
             with os.scandir(dir_path) as it:
                 for entry in it:
-                    if entry.name in skip_directories:
-                        continue
                     if entry.is_dir(follow_symlinks=False):
+                        if is_excluded_directory(exclusions, str(dir_path), entry.name):
+                            continue
                         child_repo = repo
-                        if entry.name != ".git" and (dir_path / entry.name / ".git").exists():
+                        if (
+                            entry.name != ".git"
+                            and (dir_path / entry.name / ".git").exists()
+                        ):
                             child_repo = entry.name
                         _walk(dir_path / entry.name, child_repo)
                     elif entry.is_file(follow_symlinks=False):
+                        if is_excluded_path(exclusions, entry.path):
+                            continue
                         language = language_for_file(entry.name)
                         if language is not None:
                             results.append((entry.path, language.name, repo))
         except PermissionError as exc:
-            print(f"[belief-map] WARNING: could not scan {dir_path}: {exc}", file=sys.stderr)
+            print(
+                f"[belief-map] WARNING: could not scan {dir_path}: {exc}",
+                file=sys.stderr,
+            )
 
     _walk(root_path, root_path.name)
     return results
@@ -304,6 +351,7 @@ def discover_files(
 # Incremental cache
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class LanguageDependencyIssue:
     language: Language
@@ -311,9 +359,7 @@ class LanguageDependencyIssue:
 
 
 def _active_languages(language_names: frozenset[str]) -> tuple[Language, ...]:
-    return tuple(
-        language for language in LANGUAGES if language.name in language_names
-    )
+    return tuple(language for language in LANGUAGES if language.name in language_names)
 
 
 def _dependency_issues(
@@ -324,9 +370,7 @@ def _dependency_issues(
         unavailable: list[str] = []
         for dependency in language.dependencies:
             try:
-                installed_version = importlib.metadata.version(
-                    dependency.distribution
-                )
+                installed_version = importlib.metadata.version(dependency.distribution)
             except importlib.metadata.PackageNotFoundError:
                 unavailable.append(f"{dependency.requirement} (missing)")
                 continue
@@ -348,8 +392,7 @@ def _report_dependency_issues(
     )
     for issue in issues:
         print(
-            f"[belief-map]   {issue.language.display_name}: "
-            f"{', '.join(issue.unavailable)}",
+            f"[belief-map]   {issue.language.display_name}: {', '.join(issue.unavailable)}",
             file=sys.stderr,
         )
     print(
@@ -358,9 +401,7 @@ def _report_dependency_issues(
     )
     skill_root = Path(__file__).resolve().parent.parent
     for issue in issues:
-        requirements_path = (
-            skill_root / "requirements" / f"{issue.language.name}.txt"
-        )
+        requirements_path = skill_root / "requirements" / f"{issue.language.name}.txt"
         print(
             f'[belief-map]   python3 -m pip install -r "{requirements_path}"',
             file=sys.stderr,
@@ -373,35 +414,39 @@ def _report_dependency_issues(
 
 def _builder_fingerprint(
     language_names: frozenset[str],
-    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+    exclusions: DiscoveryExclusions = DEFAULT_DISCOVERY_EXCLUSIONS,
 ) -> str:
     """Fingerprint active parsers, dependencies, and shared configuration."""
     active_languages = _active_languages(language_names)
-    dependency_packages = sorted({
-        dependency.distribution
-        for language in active_languages
-        for dependency in language.dependencies
-    })
+    dependency_packages = sorted(
+        {
+            dependency.distribution
+            for language in active_languages
+            for dependency in language.dependencies
+        }
+    )
     dependency_versions = "|".join(
-        f"{name}={importlib.metadata.version(name)}"
-        for name in dependency_packages
+        f"{name}={importlib.metadata.version(name)}" for name in dependency_packages
     )
     config = "|".join(
         (
             BUILDER_CONFIG_VERSION,
             ",".join(sorted(language_names)),
             dependency_versions,
-            ",".join(sorted(skip_directories)),
+            ",".join(sorted(exclusions.directory_names)),
+            ",".join(sorted(exclusions.paths)),
         )
     )
     digest = hashlib.sha256()
     digest.update(config.encode("utf-8"))
     language_root = Path(__file__).parent / "lang"
-    source_paths = [Path(__file__), *sorted(language_root.glob("*.py"))]
+    source_paths = [
+        Path(__file__),
+        Path(__file__).parent / "git_ignore.py",
+        *sorted(language_root.glob("*.py")),
+    ]
     for language in active_languages:
-        source_paths.extend(
-            sorted((language_root / language.name).rglob("*.py"))
-        )
+        source_paths.extend(sorted((language_root / language.name).rglob("*.py")))
     for source_path in source_paths:
         digest.update(str(source_path.relative_to(Path(__file__).parent)).encode())
         with open(source_path, "rb") as source:
@@ -435,8 +480,7 @@ def _atomic_write_text(path: str, content: str) -> None:
                 os.unlink(temporary_path)
             except OSError as cleanup_error:
                 print(
-                    f"[belief-map] ERROR: could not remove {temporary_path}: "
-                    f"{cleanup_error}",
+                    f"[belief-map] ERROR: could not remove {temporary_path}: {cleanup_error}",
                     file=sys.stderr,
                 )
         raise
@@ -445,7 +489,7 @@ def _atomic_write_text(path: str, content: str) -> None:
 def load_cache(
     root: str,
     language_names: frozenset[str],
-    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+    exclusions: DiscoveryExclusions = DEFAULT_DISCOVERY_EXCLUSIONS,
 ) -> dict:
     """Load compatible cache entries or rebuild with an explicit warning."""
     cache_path = os.path.join(root, CACHE_FILE)
@@ -456,22 +500,20 @@ def load_cache(
             cache = json.load(cache_file)
     except (json.JSONDecodeError, OSError) as exc:
         print(
-            f"[belief-map] WARNING: could not load cache {cache_path}: {exc}; "
-            "rebuilding",
+            f"[belief-map] WARNING: could not load cache {cache_path}: {exc}; rebuilding",
             file=sys.stderr,
         )
         return {}
 
     if not isinstance(cache, dict):
         print(
-            f"[belief-map] WARNING: incompatible cache {cache_path}: "
-            "top-level value must be an object; rebuilding",
+            f"[belief-map] WARNING: incompatible cache {cache_path}: top-level value must be an object; rebuilding",
             file=sys.stderr,
         )
         return {}
     expected_fingerprint = _builder_fingerprint(
         language_names,
-        skip_directories,
+        exclusions,
     )
     if (
         cache.get("schema_version") != CACHE_SCHEMA_VERSION
@@ -479,8 +521,7 @@ def load_cache(
         or not isinstance(cache.get("entries"), dict)
     ):
         print(
-            f"[belief-map] WARNING: incompatible cache {cache_path}: "
-            "schema or builder fingerprint changed; rebuilding",
+            f"[belief-map] WARNING: incompatible cache {cache_path}: schema or builder fingerprint changed; rebuilding",
             file=sys.stderr,
         )
         return {}
@@ -494,14 +535,14 @@ def save_cache(
     root: str,
     entries: dict,
     language_names: frozenset[str],
-    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+    exclusions: DiscoveryExclusions = DEFAULT_DISCOVERY_EXCLUSIONS,
 ) -> None:
     cache_path = os.path.join(root, CACHE_FILE)
     cache = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "builder_fingerprint": _builder_fingerprint(
             language_names,
-            skip_directories,
+            exclusions,
         ),
         "entries": entries,
     }
@@ -517,7 +558,14 @@ def decode_cache_entry(entry: object) -> Result[FileResult, str]:
     if not isinstance(raw_result, dict):
         return Err("cache entry result must be an object")
 
-    string_fields = ("path", "language", "repo", "content_hash", "purpose", "naming_convention")
+    string_fields = (
+        "path",
+        "language",
+        "repo",
+        "content_hash",
+        "purpose",
+        "naming_convention",
+    )
     for field_name in string_fields:
         if not isinstance(raw_result.get(field_name), str):
             return Err(f"cache result field {field_name} must be a string")
@@ -573,6 +621,7 @@ def make_node_id(path: str, root: str) -> str:
 
 # Graph building
 # ---------------------------------------------------------------------------
+
 
 def _build_node_indexes(
     results: list[FileResult],
@@ -661,7 +710,7 @@ def _resolve_target_entity(
 def build_graph(
     results: list[FileResult],
     root: str,
-    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+    exclusions: DiscoveryExclusions = DEFAULT_DISCOVERY_EXCLUSIONS,
 ) -> Result[GraphBuildOutput, GraphBuildError]:
     index_result = _build_node_indexes(results, root)
     if isinstance(index_result, Err):
@@ -670,7 +719,7 @@ def build_graph(
 
     result_languages = {result.language for result in results}
     bound_languages = {
-        language.name: language.bind(root, path_to_id, skip_directories)
+        language.name: language.bind(root, path_to_id, exclusions)
         for language in LANGUAGES
         if result_languages.intersection(language.result_languages)
     }
@@ -716,9 +765,17 @@ def build_graph(
 
         # Gap 3 fix: enrich purpose with entity-name heuristics
         purpose = r.purpose
-        if r.entities and purpose in ("general module", "NestJS wiring module", "NestJS injectable"):
+        if r.entities and purpose in (
+            "general module",
+            "NestJS wiring module",
+            "NestJS injectable",
+        ):
             enhanced = infer_purpose(r.path, "", r.language, r.entities)
-            if enhanced not in ("general module", "NestJS wiring module", "NestJS injectable"):
+            if enhanced not in (
+                "general module",
+                "NestJS wiring module",
+                "NestJS injectable",
+            ):
                 purpose = enhanced
 
         # -- build node with entities --
@@ -753,14 +810,9 @@ def build_graph(
                 r.path,
             )
             if target_id and target_id != node_id:
-                resolved_imports.setdefault(target_id, set()).add(
-                    relation["relation"]
-                )
+                resolved_imports.setdefault(target_id, set()).add(relation["relation"])
 
-        local_entities = {
-            entity["name"]
-            for entity in r.entities
-        }
+        local_entities = {entity["name"] for entity in r.entities}
         for relation in r.relations:
             source_entity = relation.get("source_entity", "")
             target_entity = relation.get("target_entity", "")
@@ -782,12 +834,14 @@ def build_graph(
             if edge_key in seen_edges:
                 continue
             seen_edges.add(edge_key)
-            edges.append({
-                "source": source_ref,
-                "target": target_ref,
-                "type": "REFERENCES",
-                "relations": [relation["relation"]],
-            })
+            edges.append(
+                {
+                    "source": source_ref,
+                    "target": target_ref,
+                    "type": "REFERENCES",
+                    "relations": [relation["relation"]],
+                }
+            )
 
         # -- module-level IMPORTS edges --
         for target_id, relations in sorted(resolved_imports.items()):
@@ -797,13 +851,15 @@ def build_graph(
             seen_edges.add(edge_key)
             target_r = id_to_result.get(target_id)
             via_base = bool(target_r and target_r.exports_abstract)
-            edges.append({
-                "source": node_id,
-                "target": target_id,
-                "type": "IMPORTS",
-                "via_base": via_base,
-                "relations": sorted(relations),
-            })
+            edges.append(
+                {
+                    "source": node_id,
+                    "target": target_id,
+                    "type": "IMPORTS",
+                    "via_base": via_base,
+                    "relations": sorted(relations),
+                }
+            )
 
         # -- CALLS_API edges (implements/extends + entity :bases) --
         # Source 1: FileResult.implements + extends (from heritage clauses)
@@ -835,12 +891,14 @@ def build_graph(
             edge_key = (node_id, provider_id, "CALLS_API")
             if edge_key not in seen_edges:
                 seen_edges.add(edge_key)
-                edges.append({
-                    "source": node_id,
-                    "target": provider_id,
-                    "type": "CALLS_API",
-                    "via_interface": True,
-                })
+                edges.append(
+                    {
+                        "source": node_id,
+                        "target": provider_id,
+                        "type": "CALLS_API",
+                        "via_interface": True,
+                    }
+                )
 
         # -- DATA_FLOWS_TO edges --
         for imp in r.imports:
@@ -851,12 +909,14 @@ def build_graph(
                     edge_key = (node_id, target_id, "DATA_FLOWS_TO")
                     if edge_key not in seen_edges:
                         seen_edges.add(edge_key)
-                        edges.append({
-                            "source": node_id,
-                            "target": target_id,
-                            "type": "DATA_FLOWS_TO",
-                            "validated": True,
-                        })
+                        edges.append(
+                            {
+                                "source": node_id,
+                                "target": target_id,
+                                "type": "DATA_FLOWS_TO",
+                                "validated": True,
+                            }
+                        )
 
         # -- entity-level REFERENCES edges --
         # For each imported name, link source_entity -> target_entity
@@ -901,27 +961,37 @@ def build_graph(
                     )
                     if edge_key not in seen_edges:
                         seen_edges.add(edge_key)
-                        edges.append({
-                            "source": f"{node_id}::{ref_ent}",
-                            "target": f"{target_id}::{target_entity}",
-                            "type": "REFERENCES",
-                        })
+                        edges.append(
+                            {
+                                "source": f"{node_id}::{ref_ent}",
+                                "target": f"{target_id}::{target_entity}",
+                                "type": "REFERENCES",
+                            }
+                        )
             else:
                 # Module-level reference (not inside a specific entity)
                 edge_key = (node_id, f"{target_id}::{target_entity}", "REFERENCES")
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
-                    edges.append({
-                        "source": node_id,
-                        "target": f"{target_id}::{target_entity}",
-                        "type": "REFERENCES",
-                    })
+                    edges.append(
+                        {
+                            "source": node_id,
+                            "target": f"{target_id}::{target_entity}",
+                            "type": "REFERENCES",
+                        }
+                    )
 
     # -- Gap 2: BOUNDARY violation detection --
     # -- HTTP_CALLS edges (cross-service HTTP client detection) --
     # Detect modules with entities named *Client, *ClientService, *ClientApi,
     # *External, *Remote and infer the target service from the class name.
-    _HTTP_CLIENT_SUFFIXES = ("Client", "ClientService", "ClientApi", "External", "Remote")
+    _HTTP_CLIENT_SUFFIXES = (
+        "Client",
+        "ClientService",
+        "ClientApi",
+        "External",
+        "Remote",
+    )
     _REPO_NAMES = {r.repo for r in results}
     for node_id, r in id_to_result.items():
         for ent in r.entities:
@@ -946,20 +1016,26 @@ def build_graph(
                 if repo == r.repo:
                     continue  # skip self
                 repo_lower = repo.lower()
-                if kebab == repo_lower or kebab.startswith(repo_lower) or repo_lower.startswith(kebab):
+                if (
+                    kebab == repo_lower
+                    or kebab.startswith(repo_lower)
+                    or repo_lower.startswith(kebab)
+                ):
                     target_repo = repo
                     break
             if target_repo:
                 edge_key = (node_id, target_repo, "HTTP_CALLS")
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
-                    edges.append({
-                        "source": node_id,
-                        "target": target_repo,
-                        "type": "HTTP_CALLS",
-                        "transport": "http",
-                        "client_entity": ent_name,
-                    })
+                    edges.append(
+                        {
+                            "source": node_id,
+                            "target": target_repo,
+                            "type": "HTTP_CALLS",
+                            "transport": "http",
+                            "client_entity": ent_name,
+                        }
+                    )
 
     # Domain modules should not import directly from infrastructure without
     # going through an interface (via_base). Flag violations.
@@ -975,21 +1051,31 @@ def build_graph(
         src_p = (src_purpose.purpose or "").lower()
         tgt_p = (tgt_purpose.purpose or "").lower()
         # Domain importing infrastructure without going through base class
-        if ("domain" in src_p and "infrastructure" in tgt_p and not edge.get("via_base")):
-            edges.append({
-                "source": src, "target": tgt,
-                "type": "VIOLATION",
-                "rule": "boundary",
-                "detail": "domain imports infrastructure without abstract base",
-            })
+        if "domain" in src_p and "infrastructure" in tgt_p and not edge.get("via_base"):
+            edges.append(
+                {
+                    "source": src,
+                    "target": tgt,
+                    "type": "VIOLATION",
+                    "rule": "boundary",
+                    "detail": "domain imports infrastructure without abstract base",
+                }
+            )
         # UI/component importing infrastructure directly
-        if ("ui component" in src_p and "infrastructure" in tgt_p and not edge.get("via_base")):
-            edges.append({
-                "source": src, "target": tgt,
-                "type": "VIOLATION",
-                "rule": "boundary",
-                "detail": "UI imports infrastructure without abstract base",
-            })
+        if (
+            "ui component" in src_p
+            and "infrastructure" in tgt_p
+            and not edge.get("via_base")
+        ):
+            edges.append(
+                {
+                    "source": src,
+                    "target": tgt,
+                    "type": "VIOLATION",
+                    "rule": "boundary",
+                    "detail": "UI imports infrastructure without abstract base",
+                }
+            )
 
     return Ok(GraphBuildOutput(nodes, edges))
 
@@ -1016,6 +1102,7 @@ def _find_local_references(
 # ---------------------------------------------------------------------------
 # LSP Client -- JSON-RPC over stdio
 # ---------------------------------------------------------------------------
+
 
 class LspClient:
     """
@@ -1094,7 +1181,7 @@ class LspClient:
 
                 header_end = buf.index(b"\r\n\r\n")
                 headers = buf[:header_end].decode("ascii")
-                buf = buf[header_end + 4:]
+                buf = buf[header_end + 4 :]
 
                 content_length = 0
                 for line in headers.split("\r\n"):
@@ -1154,7 +1241,9 @@ class LspClient:
 
     # -- Request / Notification helpers --
 
-    def _request(self, method: str, params: Any, timeout: float = LSP_REQUEST_TIMEOUT) -> Any:
+    def _request(
+        self, method: str, params: Any, timeout: float = LSP_REQUEST_TIMEOUT
+    ) -> Any:
         """Send a request and wait for the response (blocking)."""
         if not self._alive:
             return None
@@ -1182,7 +1271,9 @@ class LspClient:
         self._send({"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params})
         return msg_id
 
-    def _request_collect(self, msg_id: int, timeout: float = LSP_REQUEST_TIMEOUT) -> Any:
+    def _request_collect(
+        self, msg_id: int, timeout: float = LSP_REQUEST_TIMEOUT
+    ) -> Any:
         """Wait for a previously fired request's response."""
         if msg_id < 0 or msg_id not in self._events:
             return None
@@ -1204,25 +1295,31 @@ class LspClient:
 
     def initialize(self, root_uri: str) -> bool:
         """Send initialize request. Returns True on success."""
-        result = self._request("initialize", {
-            "processId": os.getpid(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "callHierarchy": {
-                        "dynamicRegistration": False,
-                    },
-                    "references": {
-                        "dynamicRegistration": False,
-                    },
-                    "synchronization": {
-                        "didOpen": True,
-                        "didClose": True,
+        result = self._request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {
+                        "callHierarchy": {
+                            "dynamicRegistration": False,
+                        },
+                        "references": {
+                            "dynamicRegistration": False,
+                        },
+                        "synchronization": {
+                            "didOpen": True,
+                            "didClose": True,
+                        },
                     },
                 },
+                "workspaceFolders": [
+                    {"uri": root_uri, "name": os.path.basename(uri_to_path(root_uri))}
+                ],
             },
-            "workspaceFolders": [{"uri": root_uri, "name": os.path.basename(uri_to_path(root_uri))}],
-        }, timeout=LSP_INIT_TIMEOUT)
+            timeout=LSP_INIT_TIMEOUT,
+        )
         if result is not None:
             self._notify("initialized", {})
             return True
@@ -1251,25 +1348,33 @@ class LspClient:
 
     def did_open(self, uri: str, language_id: str, text: str) -> None:
         """Notify server that a document was opened."""
-        self._notify("textDocument/didOpen", {
-            "textDocument": {
-                "uri": uri,
-                "languageId": language_id,
-                "version": 1,
-                "text": text,
+        self._notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text,
+                },
             },
-        })
+        )
 
     def did_close(self, uri: str) -> None:
         """Notify server that a document was closed."""
-        self._notify("textDocument/didClose", {
-            "textDocument": {"uri": uri},
-        })
+        self._notify(
+            "textDocument/didClose",
+            {
+                "textDocument": {"uri": uri},
+            },
+        )
 
     # -- Query operations --
 
     def document_symbols(
-        self, uri: str, timeout: float = LSP_REQUEST_TIMEOUT,
+        self,
+        uri: str,
+        timeout: float = LSP_REQUEST_TIMEOUT,
     ) -> list[dict]:
         """
         Get all symbols in a document. Returns a tree of DocumentSymbol objects.
@@ -1278,54 +1383,86 @@ class LspClient:
         SymbolKind: 5=Class, 6=Method, 11=Interface, 12=Function, 13=Variable,
                     10=Enum, 26=TypeParameter, 15=Namespace.
         """
-        result = self._request("textDocument/documentSymbol", {
-            "textDocument": {"uri": uri},
-        }, timeout=timeout)
+        result = self._request(
+            "textDocument/documentSymbol",
+            {
+                "textDocument": {"uri": uri},
+            },
+            timeout=timeout,
+        )
         return result if isinstance(result, list) else []
 
     def prepare_call_hierarchy(
-        self, uri: str, line: int, character: int, timeout: float = LSP_REQUEST_TIMEOUT,
+        self,
+        uri: str,
+        line: int,
+        character: int,
+        timeout: float = LSP_REQUEST_TIMEOUT,
     ) -> list[dict]:
         """
         Prepare call hierarchy at position. Returns list of CallHierarchyItem.
         Line and character are 0-based (LSP convention).
         """
-        result = self._request("textDocument/prepareCallHierarchy", {
-            "textDocument": {"uri": uri},
-            "position": {"line": line, "character": character},
-        }, timeout=timeout)
+        result = self._request(
+            "textDocument/prepareCallHierarchy",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+            },
+            timeout=timeout,
+        )
         return result if isinstance(result, list) else []
 
     def outgoing_calls(
-        self, item: dict, timeout: float = LSP_REQUEST_TIMEOUT,
+        self,
+        item: dict,
+        timeout: float = LSP_REQUEST_TIMEOUT,
     ) -> list[dict]:
         """Get outgoing calls from a CallHierarchyItem."""
-        result = self._request("callHierarchy/outgoingCalls", {
-            "item": item,
-        }, timeout=timeout)
+        result = self._request(
+            "callHierarchy/outgoingCalls",
+            {
+                "item": item,
+            },
+            timeout=timeout,
+        )
         return result if isinstance(result, list) else []
 
     def incoming_calls(
-        self, item: dict, timeout: float = LSP_REQUEST_TIMEOUT,
+        self,
+        item: dict,
+        timeout: float = LSP_REQUEST_TIMEOUT,
     ) -> list[dict]:
         """Get incoming calls to a CallHierarchyItem."""
-        result = self._request("callHierarchy/incomingCalls", {
-            "item": item,
-        }, timeout=timeout)
+        result = self._request(
+            "callHierarchy/incomingCalls",
+            {
+                "item": item,
+            },
+            timeout=timeout,
+        )
         return result if isinstance(result, list) else []
 
     def references(
-        self, uri: str, line: int, character: int, timeout: float = LSP_REQUEST_TIMEOUT,
+        self,
+        uri: str,
+        line: int,
+        character: int,
+        timeout: float = LSP_REQUEST_TIMEOUT,
     ) -> list[dict]:
         """
         Find all references to the symbol at position.
         Returns list of Location {uri, range}.
         """
-        result = self._request("textDocument/references", {
-            "textDocument": {"uri": uri},
-            "position": {"line": line, "character": character},
-            "context": {"includeDeclaration": False},
-        }, timeout=timeout)
+        result = self._request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": False},
+            },
+            timeout=timeout,
+        )
         return result if isinstance(result, list) else []
 
 
@@ -1333,10 +1470,11 @@ class LspClient:
 # Project discovery for LSP
 # ---------------------------------------------------------------------------
 
+
 def discover_projects(
     root: str,
     file_results: list[FileResult],
-    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+    exclusions: DiscoveryExclusions = DEFAULT_DISCOVERY_EXCLUSIONS,
 ) -> list[ProjectGroup]:
     """Group source files by the closest language-owned project config."""
     configs_by_language: dict[str, list[str]] = {
@@ -1344,14 +1482,17 @@ def discover_projects(
     }
     for directory_path, directory_names, file_names in os.walk(root):
         directory_names[:] = [
-            name for name in directory_names if name not in skip_directories
+            name
+            for name in directory_names
+            if not is_excluded_directory(exclusions, directory_path, name)
         ]
         for file_name in file_names:
+            config_path = os.path.join(directory_path, file_name)
+            if is_excluded_path(exclusions, config_path):
+                continue
             for language in LANGUAGES:
                 if language.accepts_project_config(file_name):
-                    configs_by_language[language.name].append(
-                        os.path.join(directory_path, file_name)
-                    )
+                    configs_by_language[language.name].append(config_path)
 
     projects: list[ProjectGroup] = []
     assigned_files: set[str] = set()
@@ -1408,7 +1549,7 @@ _SK_TO_KIND = {
     _SK_METHOD: "method",
     _SK_INTERFACE: "interface",
     _SK_FUNCTION: "function",
-    _SK_VARIABLE: "function",   # const exports
+    _SK_VARIABLE: "function",  # const exports
     _SK_CONSTANT: "function",
     _SK_ENUM: "enum",
     _SK_TYPE_PARAMETER: "type",
@@ -1490,27 +1631,47 @@ def _process_doc_symbol(
             if child_kind in (_SK_METHOD, _SK_PROPERTY, _SK_FUNCTION) and child_name:
                 methods.append(child_name)
         kind = "class" if kind_int == _SK_CLASS else "interface"
-        entities.append({
-            "name": name, "kind": kind, "line": line,
-            "methods": methods, "bases": [], "decorators": [],
-        })
+        entities.append(
+            {
+                "name": name,
+                "kind": kind,
+                "line": line,
+                "methods": methods,
+                "bases": [],
+                "decorators": [],
+            }
+        )
         seen_names.add(name)
         exported_names.append(name)
 
     elif kind_int == _SK_ENUM:
-        members = [c.get("name", "") for c in children if c.get("kind") == _SK_ENUM_MEMBER]
-        entities.append({
-            "name": name, "kind": "enum", "line": line,
-            "methods": members, "bases": [], "decorators": [],
-        })
+        members = [
+            c.get("name", "") for c in children if c.get("kind") == _SK_ENUM_MEMBER
+        ]
+        entities.append(
+            {
+                "name": name,
+                "kind": "enum",
+                "line": line,
+                "methods": members,
+                "bases": [],
+                "decorators": [],
+            }
+        )
         seen_names.add(name)
         exported_names.append(name)
 
     elif kind_int == _SK_FUNCTION:
-        entities.append({
-            "name": name, "kind": "function", "line": line,
-            "methods": [], "bases": [], "decorators": [],
-        })
+        entities.append(
+            {
+                "name": name,
+                "kind": "function",
+                "line": line,
+                "methods": [],
+                "bases": [],
+                "decorators": [],
+            }
+        )
         seen_names.add(name)
         exported_names.append(name)
 
@@ -1525,18 +1686,30 @@ def _process_doc_symbol(
                     child_name = child.get("name", "")
                     if child_name:
                         methods.append(child_name)
-            entities.append({
-                "name": name, "kind": ent_kind, "line": line,
-                "methods": methods, "bases": [], "decorators": [],
-            })
+            entities.append(
+                {
+                    "name": name,
+                    "kind": ent_kind,
+                    "line": line,
+                    "methods": methods,
+                    "bases": [],
+                    "decorators": [],
+                }
+            )
             seen_names.add(name)
             exported_names.append(name)
 
     elif kind_int == _SK_TYPE_PARAMETER:
-        entities.append({
-            "name": name, "kind": "type", "line": line,
-            "methods": [], "bases": [], "decorators": [],
-        })
+        entities.append(
+            {
+                "name": name,
+                "kind": "type",
+                "line": line,
+                "methods": [],
+                "bases": [],
+                "decorators": [],
+            }
+        )
         seen_names.add(name)
         exported_names.append(name)
 
@@ -1559,10 +1732,16 @@ def _process_symbol_info(
     if not kind:
         return
 
-    entities.append({
-        "name": name, "kind": kind, "line": line,
-        "methods": [], "bases": [], "decorators": [],
-    })
+    entities.append(
+        {
+            "name": name,
+            "kind": kind,
+            "line": line,
+            "methods": [],
+            "bases": [],
+            "decorators": [],
+        }
+    )
     seen_names.add(name)
     exported_names.append(name)
 
@@ -1608,12 +1787,14 @@ def _drain_prepare_batch(
             if not target_node_id:
                 continue
             from_ranges = [fr["start"]["line"] + 1 for fr in call.get("fromRanges", [])]
-            lsp_edges.append(LspEdge(
-                source=f"{node_id}::{ent_name}",
-                target=f"{target_node_id}::{target_name}",
-                edge_type="CALLS",
-                metadata={"from_lines": from_ranges, "lsp_verified": True},
-            ))
+            lsp_edges.append(
+                LspEdge(
+                    source=f"{node_id}::{ent_name}",
+                    target=f"{target_node_id}::{target_name}",
+                    edge_type="CALLS",
+                    metadata={"from_lines": from_ranges, "lsp_verified": True},
+                )
+            )
             calls_found += 1
     return calls_found
 
@@ -1672,23 +1853,24 @@ def _drain_reference_batch(
                     ref_line_0,
                 )
             source_key = (
-                f"{ref_node_id}::{ref_entity_name}"
-                if ref_entity_name
-                else ref_node_id
+                f"{ref_node_id}::{ref_entity_name}" if ref_entity_name else ref_node_id
             )
             target_key = f"{src_node_id}::{ent_name}"
-            lsp_edges.append(LspEdge(
-                source=source_key,
-                target=target_key,
-                edge_type="REFERENCES",
-                metadata={"lsp_verified": True, "ref_line": ref_line_0 + 1},
-            ))
+            lsp_edges.append(
+                LspEdge(
+                    source=source_key,
+                    target=target_key,
+                    edge_type="REFERENCES",
+                    metadata={"lsp_verified": True, "ref_line": ref_line_0 + 1},
+                )
+            )
             refs_found += 1
     return refs_found
 
 
 def _find_enclosing_entity(
-    entities: Sequence[EntityPayload], line_0based: int,
+    entities: Sequence[EntityPayload],
+    line_0based: int,
 ) -> Optional[str]:
     """
     Find the entity that encloses the given 0-based line.
@@ -1723,6 +1905,7 @@ def analyze_project_lsp(
     # Check server availability
     server_bin = cmd[0]
     from shutil import which
+
     if not which(server_bin):
         print(f"  [lsp] WARNING: {server_bin} not found, skipping {project.root}")
         return []
@@ -1794,7 +1977,9 @@ def analyze_project_lsp(
                             if old_ent["name"] == ent["name"]:
                                 if not ent.get("bases") and old_ent.get("bases"):
                                     ent["bases"] = old_ent.get("bases", [])
-                                if not ent.get("decorators") and old_ent.get("decorators"):
+                                if not ent.get("decorators") and old_ent.get(
+                                    "decorators"
+                                ):
                                     ent["decorators"] = old_ent.get(
                                         "decorators",
                                         [],
@@ -1812,7 +1997,9 @@ def analyze_project_lsp(
                 symbols_replaced += 1
 
         if symbols_replaced:
-            print(f"  [lsp] {proj_name}: merged entities in {symbols_replaced} files via documentSymbol")
+            print(
+                f"  [lsp] {proj_name}: merged entities in {symbols_replaced} files via documentSymbol"
+            )
 
         # -- Phase 2: Pipelined call hierarchy + references --
         # Strategy: for each file, fire all prepareCallHierarchy and
@@ -1849,19 +2036,25 @@ def analyze_project_lsp(
                 ent_col = find_entity_column(content, ent_name, ent["line"])
 
                 if ent["kind"] in ("function", "class"):
-                    mid = client._request_fire("textDocument/prepareCallHierarchy", {
-                        "textDocument": {"uri": uri},
-                        "position": {"line": ent_line_0, "character": ent_col},
-                    })
+                    mid = client._request_fire(
+                        "textDocument/prepareCallHierarchy",
+                        {
+                            "textDocument": {"uri": uri},
+                            "position": {"line": ent_line_0, "character": ent_col},
+                        },
+                    )
                     if mid >= 0:
                         pending_prepare.append((mid, ent_name, ent))
 
                 if ent_name in r.exported_names:
-                    mid = client._request_fire("textDocument/references", {
-                        "textDocument": {"uri": uri},
-                        "position": {"line": ent_line_0, "character": ent_col},
-                        "context": {"includeDeclaration": False},
-                    })
+                    mid = client._request_fire(
+                        "textDocument/references",
+                        {
+                            "textDocument": {"uri": uri},
+                            "position": {"line": ent_line_0, "character": ent_col},
+                            "context": {"includeDeclaration": False},
+                        },
+                    )
                     if mid >= 0:
                         pending_refs.append((mid, ent_name, node_id))
 
@@ -1875,8 +2068,12 @@ def analyze_project_lsp(
                         )
                     )
                     calls_found += _drain_prepare_batch(
-                        client, prepare_batch,
-                        path_to_node_id, node_id, lsp_edges, request_timeout,
+                        client,
+                        prepare_batch,
+                        path_to_node_id,
+                        node_id,
+                        lsp_edges,
+                        request_timeout,
                     )
                     refs_found += _drain_reference_batch(
                         client,
@@ -1889,7 +2086,12 @@ def analyze_project_lsp(
 
             # -- Collect remaining prepareCallHierarchy results --
             calls_found += _drain_prepare_batch(
-                client, pending_prepare, path_to_node_id, node_id, lsp_edges, request_timeout,
+                client,
+                pending_prepare,
+                path_to_node_id,
+                node_id,
+                lsp_edges,
+                request_timeout,
             )
 
             # -- Collect remaining references results --
@@ -1904,12 +2106,16 @@ def analyze_project_lsp(
 
             processed += len(r.entities)
             if processed % 200 < len(r.entities):
-                print(f"  [lsp] {proj_name}: {processed}/{total_entities} entities "
-                      f"({calls_found} calls, {refs_found} refs)")
+                print(
+                    f"  [lsp] {proj_name}: {processed}/{total_entities} entities "
+                    f"({calls_found} calls, {refs_found} refs)"
+                )
 
             client.did_close(uri)
 
-        print(f"  [lsp] {proj_name}: done -- {calls_found} calls, {refs_found} refs from {processed} entities")
+        print(
+            f"  [lsp] {proj_name}: done -- {calls_found} calls, {refs_found} refs from {processed} entities"
+        )
 
     except Exception as exc:
         print(f"  [lsp] ERROR in {proj_name}: {exc}")
@@ -1922,6 +2128,7 @@ def analyze_project_lsp(
 # ---------------------------------------------------------------------------
 # LSP merge -- integrate LSP edges into the graph
 # ---------------------------------------------------------------------------
+
 
 def merge_lsp_edges(
     edges: list[dict],
@@ -1971,13 +2178,14 @@ def merge_lsp_edges(
 # LSP enrichment orchestrator
 # ---------------------------------------------------------------------------
 
+
 def enrich_with_lsp(
     root: str,
     results: list[FileResult],
     nodes: list[dict],
     edges: list[dict],
     request_timeout: float,
-    skip_directories: frozenset[str] = frozenset(SKIP_DIRS),
+    exclusions: DiscoveryExclusions = DEFAULT_DISCOVERY_EXCLUSIONS,
 ) -> tuple[list[dict], list[dict]]:
     """Run language-owned LSP analysis and merge its graph evidence."""
     # Build lookup tables
@@ -1989,18 +2197,19 @@ def enrich_with_lsp(
         node_id_to_result[nid] = r
 
     # Discover projects
-    projects = discover_projects(root, results, skip_directories)
+    projects = discover_projects(root, results, exclusions)
     if not projects:
         config_names = ", ".join(
-            sorted({
-                config_name
-                for language in LANGUAGES
-                for config_name in language.project_config_names
-            })
+            sorted(
+                {
+                    config_name
+                    for language in LANGUAGES
+                    for config_name in language.project_config_names
+                }
+            )
         )
         print(
-            "[belief-map] No LSP-compatible projects found "
-            f"(expected one of: {config_names})"
+            f"[belief-map] No LSP-compatible projects found (expected one of: {config_names})"
         )
         return nodes, edges
 
@@ -2014,16 +2223,17 @@ def enrich_with_lsp(
             language_stats.append(
                 f"{len(language_projects)} {language.lsp_label}/{file_count} files"
             )
-    print(
-        f"[belief-map] LSP: {len(projects)} projects "
-        f"({', '.join(language_stats)})"
-    )
+    print(f"[belief-map] LSP: {len(projects)} projects ({', '.join(language_stats)})")
 
     all_lsp_edges: list[LspEdge] = []
 
     for project in projects:
         proj_edges = analyze_project_lsp(
-            project, root, path_to_node_id, node_id_to_result, request_timeout,
+            project,
+            root,
+            path_to_node_id,
+            node_id_to_result,
+            request_timeout,
         )
         all_lsp_edges.extend(proj_edges)
 
@@ -2045,6 +2255,7 @@ def enrich_with_lsp(
 # Output formatters
 # ---------------------------------------------------------------------------
 
+
 def _sexp_escape(s: str) -> str:
     """Escape a string for S-expression output (double-quote delimited)."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -2059,6 +2270,7 @@ def _entity_id(module_path: str, entity_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Path trie for compressed path definitions
 # ---------------------------------------------------------------------------
+
 
 def _build_path_tree(path_sid_pairs: list[tuple[str, str]]) -> list[str]:
     """
@@ -2205,7 +2417,9 @@ def render_sexp(
             base = prefix
             idx = 2
             while prefix in _REPO_PREFIX.values():
-                prefix = base + repo[idx:idx + 1] if idx < len(repo) else base + str(idx)
+                prefix = (
+                    base + repo[idx : idx + 1] if idx < len(repo) else base + str(idx)
+                )
                 idx += 1
             _REPO_PREFIX[repo] = prefix
             _repo_counters[repo] = 0
@@ -2230,7 +2444,9 @@ def render_sexp(
 
     lines.append("; Belief Map")
     lines.append(f"; mode {mode}")
-    lines.append(f"; {total_files} files {len(sorted_nodes)} nodes {len(real_edges)} edges {len(violations)} violations")
+    lines.append(
+        f"; {total_files} files {len(sorted_nodes)} nodes {len(real_edges)} edges {len(violations)} violations"
+    )
     lines.append(
         f"(belief-map :schema {MAP_SCHEMA_VERSION} :files {total_files} "
         f":nodes {len(sorted_nodes)} :edges {len(real_edges)} "
@@ -2240,12 +2456,8 @@ def render_sexp(
 
     # -- Path tree (compressed trie) --
     lines.append("; --- paths ---")
-    safe_nodes = [
-        node for node in sorted_nodes if _is_safe_path_atom(node["id"])
-    ]
-    unsafe_nodes = [
-        node for node in sorted_nodes if not _is_safe_path_atom(node["id"])
-    ]
+    safe_nodes = [node for node in sorted_nodes if _is_safe_path_atom(node["id"])]
+    unsafe_nodes = [node for node in sorted_nodes if not _is_safe_path_atom(node["id"])]
     for node in unsafe_nodes:
         sid = path_to_sid[node["id"]]
         escaped_path = _sexp_escape(node["id"])
@@ -2279,8 +2491,12 @@ def render_sexp(
             line_num = ent.get("line", 0)
             eid = _entity_id(node["id"], name)
             kind_tag = {
-                "class": "cls", "function": "fn", "interface": "ifc",
-                "module": "mod", "type": "typ", "enum": "enm",
+                "class": "cls",
+                "function": "fn",
+                "interface": "ifc",
+                "module": "mod",
+                "type": "typ",
+                "enum": "enm",
             }.get(kind, kind[:3])
 
             bases = ent.get("bases", [])
@@ -2302,7 +2518,9 @@ def render_sexp(
 
     # -- Edges --
     lines.append("; --- edges ---")
-    sorted_edges = sorted(real_edges, key=lambda e: (e["type"], e["source"], e["target"]))
+    sorted_edges = sorted(
+        real_edges, key=lambda e: (e["type"], e["source"], e["target"])
+    )
     for edge in sorted_edges:
         src = _pid(edge["source"])
         tgt = _pid(edge["target"])
@@ -2311,13 +2529,10 @@ def render_sexp(
         if etype == "IMPORTS":
             flags = " :via-base" if edge.get("via_base") else ""
             relation_flags = "".join(
-                f" :{relation}"
-                for relation in sorted(edge.get("relations", []))
+                f" :{relation}" for relation in sorted(edge.get("relations", []))
             )
             lsp = " :lsp" if edge.get("lsp_verified") else ""
-            lines.append(
-                f"(imports {src} {tgt}{flags}{relation_flags}{lsp})"
-            )
+            lines.append(f"(imports {src} {tgt}{flags}{relation_flags}{lsp})")
         elif etype == "CALLS_API":
             lsp = " :lsp" if edge.get("lsp_verified") else ""
             lines.append(f"(calls-api {src} {tgt} :via-ifc{lsp})")
@@ -2326,8 +2541,7 @@ def render_sexp(
             lines.append(f"(data-flow {src} {tgt}{flags})")
         elif etype == "REFERENCES":
             relation_flags = "".join(
-                f" :{relation}"
-                for relation in sorted(edge.get("relations", []))
+                f" :{relation}" for relation in sorted(edge.get("relations", []))
             )
             lsp = " :lsp" if edge.get("lsp_verified") else ""
             lines.append(f"(refs {src} {tgt}{relation_flags}{lsp})")
@@ -2371,6 +2585,7 @@ def write_sexp(
 # Main
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class BuilderOptions:
     root: str
@@ -2387,6 +2602,20 @@ def _builder_usage() -> str:
         "[--output ABSOLUTE_PATH] [--full] [--lsp] "
         "[--lsp-timeout SECONDS] [--exclude-dir NAME ...]"
     )
+
+
+def parse_directory_basename(value: str) -> Result[str, str]:
+    """Validate one portable directory basename from the public CLI."""
+    if (
+        not value
+        or value in (".", "..")
+        or "\0" in value
+        or "/" in value
+        or "\\" in value
+        or bool(PureWindowsPath(value).drive)
+    ):
+        return Err(f"--exclude-dir must be a directory name, not a path: {value}")
+    return Ok(value)
 
 
 def parse_builder_options(args: list[str]) -> Result[BuilderOptions, str]:
@@ -2410,20 +2639,10 @@ def parse_builder_options(args: list[str]) -> Result[BuilderOptions, str]:
             elif argument == "--output":
                 output_argument = value
             elif argument == "--exclude-dir":
-                if (
-                    not value
-                    or value in (".", "..")
-                    or os.path.basename(value) != value
-                    or (
-                        os.path.altsep is not None
-                        and os.path.altsep in value
-                    )
-                ):
-                    return Err(
-                        "--exclude-dir must be a directory name, not a path: "
-                        f"{value}"
-                    )
-                excluded_directories.add(value)
+                parsed_basename = parse_directory_basename(value)
+                if isinstance(parsed_basename, Err):
+                    return parsed_basename
+                excluded_directories.add(parsed_basename.value)
             else:
                 try:
                     lsp_timeout = float(value)
@@ -2460,14 +2679,16 @@ def parse_builder_options(args: list[str]) -> Result[BuilderOptions, str]:
     if not os.path.isdir(output_directory):
         return Err(f"output directory does not exist: {output_directory}")
 
-    return Ok(BuilderOptions(
-        root=root,
-        output_path=output_path,
-        full_rebuild=full_rebuild,
-        use_lsp=use_lsp,
-        lsp_timeout=lsp_timeout,
-        skip_directories=frozenset(SKIP_DIRS | excluded_directories),
-    ))
+    return Ok(
+        BuilderOptions(
+            root=root,
+            output_path=output_path,
+            full_rebuild=full_rebuild,
+            use_lsp=use_lsp,
+            lsp_timeout=lsp_timeout,
+            skip_directories=frozenset(SKIP_DIRS | excluded_directories),
+        )
+    )
 
 
 def _cache_entry_result(path: str, entry: object) -> Result[FileResult, str]:
@@ -2506,7 +2727,23 @@ def _run_build(options: BuilderOptions) -> int:
     mode = "LSP-enhanced" if options.use_lsp else "syntax"
     print(f"[belief-map] Scanning {root} ... (mode: {mode})")
 
-    files = discover_files(root, options.skip_directories)
+    git_ignore_result = load_git_ignored_paths(root, options.skip_directories)
+    if isinstance(git_ignore_result, GitIgnoreUnavailable):
+        print(
+            f"[belief-map] WARNING: repository ignore rules unavailable: {git_ignore_result.reason}",
+            file=sys.stderr,
+        )
+        ignored_paths = frozenset()
+    else:
+        ignored_paths = git_ignore_result.paths
+        if ignored_paths:
+            print(f"[belief-map] Git ignore rules excluded {len(ignored_paths)} paths")
+    exclusions = DiscoveryExclusions(
+        directory_names=options.skip_directories,
+        paths=ignored_paths,
+    )
+
+    files = discover_files(root, exclusions)
     language_counts = {
         language.name: sum(
             1 for _, language_name, _ in files if language_name == language.name
@@ -2518,16 +2755,12 @@ def _run_build(options: BuilderOptions) -> int:
         for language in LANGUAGES
     )
     extensions = ", ".join(
-        extension
-        for language in LANGUAGES
-        for extension in language.source_extensions
+        extension for language in LANGUAGES for extension in language.source_extensions
     )
     print(f"[belief-map] Found {len(files)} source files ({count_summary})")
     print(f"[belief-map] Supported source: {extensions}")
 
-    active_language_names = frozenset(
-        language_name for _, language_name, _ in files
-    )
+    active_language_names = frozenset(language_name for _, language_name, _ in files)
     dependency_issues = _dependency_issues(active_language_names)
     if dependency_issues:
         _report_dependency_issues(dependency_issues)
@@ -2536,7 +2769,7 @@ def _run_build(options: BuilderOptions) -> int:
     cache = (
         {}
         if options.full_rebuild
-        else load_cache(root, active_language_names, options.skip_directories)
+        else load_cache(root, active_language_names, exclusions)
     )
     to_parse: list[tuple[str, str, str]] = []
     cached_results: list[FileResult] = []
@@ -2549,13 +2782,14 @@ def _run_build(options: BuilderOptions) -> int:
                 cached_results.append(cached_result.value)
                 continue
             print(
-                f"[belief-map] WARNING: rebuilding invalid cache entry for "
-                f"{path}: {cached_result.error}",
+                f"[belief-map] WARNING: rebuilding invalid cache entry for {path}: {cached_result.error}",
                 file=sys.stderr,
             )
         to_parse.append((path, lang, repo))
 
-    print(f"[belief-map] Parsing {len(to_parse)} changed files ({len(cached_results)} cached)")
+    print(
+        f"[belief-map] Parsing {len(to_parse)} changed files ({len(cached_results)} cached)"
+    )
 
     new_results: list[FileResult] = []
     if to_parse:
@@ -2569,13 +2803,12 @@ def _run_build(options: BuilderOptions) -> int:
         cached_results + new_results,
         key=lambda result: os.path.relpath(result.path, root).replace(os.sep, "/"),
     )
-    graph_result = build_graph(all_results, root, options.skip_directories)
+    graph_result = build_graph(all_results, root, exclusions)
     if isinstance(graph_result, Err):
         for collision in graph_result.error.collisions:
             paths = ", ".join(collision.paths)
             print(
-                f"[belief-map] ERROR: module ID collision "
-                f"{collision.node_id}: {paths}",
+                f"[belief-map] ERROR: module ID collision {collision.node_id}: {paths}",
                 file=sys.stderr,
             )
         print(
@@ -2588,16 +2821,14 @@ def _run_build(options: BuilderOptions) -> int:
 
     syntax_elapsed = time.monotonic() - t0
     print(
-        f"[belief-map] Syntax pass: {syntax_elapsed:.2f}s -- "
-        f"{len(nodes)} nodes, {len(edges)} edges"
+        f"[belief-map] Syntax pass: {syntax_elapsed:.2f}s -- {len(nodes)} nodes, {len(edges)} edges"
     )
 
     # LSP enrichment pass (if requested)
     if options.use_lsp:
         t_lsp_start = time.monotonic()
         print(
-            f"[belief-map] Starting LSP enrichment "
-            f"(timeout={options.lsp_timeout}s per request) ..."
+            f"[belief-map] Starting LSP enrichment (timeout={options.lsp_timeout}s per request) ..."
         )
         nodes, edges = enrich_with_lsp(
             root,
@@ -2605,26 +2836,25 @@ def _run_build(options: BuilderOptions) -> int:
             nodes,
             edges,
             options.lsp_timeout,
-            options.skip_directories,
+            exclusions,
         )
         t_lsp = time.monotonic() - t_lsp_start
         print(f"[belief-map] LSP pass: {t_lsp:.2f}s")
 
-    new_cache = {
-        result.path: _serialize_file_result(result)
-        for result in all_results
-    }
+    new_cache = {result.path: _serialize_file_result(result) for result in all_results}
     map_content = render_sexp(nodes, edges, root, mode, len(all_results))
     save_cache(
         root,
         new_cache,
         active_language_names,
-        options.skip_directories,
+        exclusions,
     )
     _atomic_write_text(options.output_path, map_content)
 
     elapsed = time.monotonic() - t0
-    print(f"[belief-map] Done in {elapsed:.2f}s -- {len(nodes)} nodes, {len(edges)} edges")
+    print(
+        f"[belief-map] Done in {elapsed:.2f}s -- {len(nodes)} nodes, {len(edges)} edges"
+    )
     print(f"[belief-map] Output: {options.output_path}")
 
     # Stats
@@ -2632,6 +2862,7 @@ def _run_build(options: BuilderOptions) -> int:
     print(f"[belief-map] Repos: {', '.join(repos)}")
 
     from collections import Counter
+
     edge_types = Counter(e["type"] for e in edges)
     total_entities = sum(len(n.get("entities", [])) for n in nodes)
     lsp_verified = sum(1 for e in edges if e.get("lsp_verified"))

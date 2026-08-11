@@ -259,6 +259,12 @@ Each value is a directory basename and applies at any depth. Changing exclusions
 invalidates the incremental cache so excluded files cannot leak from an earlier
 build.
 
+Targets inside Git worktrees also use Git's repository ignore rules. The same
+resolved policy filters source files, TypeScript aliases and packages, Go and
+Rust package manifests, Ruby project configuration, and LSP project discovery.
+Git is invoked with index checks disabled so tracked snapshot paths that match
+`.gitignore` remain excluded from the belief map.
+
 Rebuild after structural changes (add/remove files, change imports, add classes).
 Search patterns support literals, `.*`, boundary `^`/`$` anchors, and
 backslash escapes. Other regex operators are rejected.
