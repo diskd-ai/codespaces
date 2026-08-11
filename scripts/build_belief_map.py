@@ -24,12 +24,14 @@ Parsers
   functions, receiver methods, and local package dependencies.
 - **Ruby**: tree-sitter (``tree-sitter-ruby``). Handles Ruby declarations,
   Rails/Zeitwerk constants, mixins, associations, jobs, mailers, and specs.
+- **Pascal**: dependency-free structural parser. Handles Free Pascal/Lazarus
+  units, programs, uses/includes, types, inheritance, methods, and routines.
 
 Modes
 -----
 **Default** (fast, ~5-8s for full workspace):
-    Parses all .py/.ts/.tsx/.rs/.cs/.java/.go/.rb/.rake files and builds
-    import/reference/data-flow edges.
+    Parses all supported Python, TypeScript, Rust, C#, Java, Go, Ruby, and
+    Pascal source files and builds import/reference/data-flow edges.
 
 **LSP-enhanced** (``--lsp``, ~1-5min):
     After default pass, starts ``typescript-language-server`` and
@@ -335,6 +337,15 @@ def discover_files(
                         if is_excluded_path(exclusions, entry.path):
                             continue
                         language = language_for_file(entry.name)
+                        if language is not None and language.name == "pascal":
+                            relative_parent_parts = Path(entry.path).relative_to(
+                                root_path
+                            ).parts[:-1]
+                            if any(
+                                part.casefold() == "backup"
+                                for part in relative_parent_parts
+                            ):
+                                continue
                         if language is not None:
                             results.append((entry.path, language.name, repo))
         except PermissionError as exc:

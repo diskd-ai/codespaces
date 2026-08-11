@@ -326,13 +326,20 @@ _TS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
 _PY_EXTENSIONS = (".py",)
 _RUBY_EXTENSIONS = (".rb", ".rake")
 _RUST_EXTENSIONS = (".rs",)
+_PASCAL_EXTENSIONS = (".pas", ".pp", ".lpr", ".inc")
 
 
 def _module_id_to_file(module_id: str, root: str) -> str:
     """Convert a module ID back to a file path relative to root."""
     base = os.path.join(root, module_id)
+    if os.path.isfile(base):
+        return base
     source_extensions = (
-        _TS_EXTENSIONS + _PY_EXTENSIONS + _RUBY_EXTENSIONS + _RUST_EXTENSIONS
+        _TS_EXTENSIONS
+        + _PY_EXTENSIONS
+        + _RUBY_EXTENSIONS
+        + _RUST_EXTENSIONS
+        + _PASCAL_EXTENSIONS
     )
     for ext in source_extensions:
         candidate = base + ext

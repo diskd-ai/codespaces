@@ -218,6 +218,28 @@ class BeliefSearchAliasTest(unittest.TestCase):
                 analyze_output.getvalue(),
             )
 
+    def test_module_paths_resolve_free_pascal_sources_and_includes(self) -> None:
+        """/* REQ-PAS-007: Search results return real Pascal source paths for every supported extension. */"""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        root = Path(tmpdir.name)
+        expected = {
+            "soft/ipKernel": root / "soft/ipKernel.lpr",
+            "soft/uWorker": root / "soft/uWorker.pas",
+            "shared/common": root / "shared/common.pp",
+            "shared/constants.inc": root / "shared/constants.inc",
+        }
+        for path in expected.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+
+        for module_id, path in expected.items():
+            with self.subTest(module_id=module_id):
+                self.assertEqual(
+                    str(path),
+                    belief_search._module_id_to_file(module_id, str(root)),
+                )
+
     def test_no_match_includes_suggestions(self) -> None:
         """/* REQ-CS-006: no-match errors must surface actionable module suggestions. */"""
         graph, _sexp_path = self._load_graph()

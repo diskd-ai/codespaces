@@ -290,6 +290,16 @@ polymorphic associations remain unlinked instead of producing guessed edges.
 Rails relation flags are preserved as `:association`, `:concern`, `:callback`,
 `:job`, `:mailer`, or `:spec` in the generated map.
 
+Pascal indexing discovers `.pas`, `.pp`, `.lpr`, and `.inc` files. It extracts
+units, programs, `uses`/`contains`/`requires` clauses, include directives,
+classes, records, interfaces, inheritance, methods, and routines. Unit names
+and paths resolve case-insensitively; explicit `UnitName in 'path.pas'` paths
+take precedence, followed by a unique unit in the importing file's directory.
+Other ambiguous unit names remain unlinked. Conditional compiler branches are
+indexed conservatively. Pascal has no LSP enrichment yet. Pascal files inside
+conventional Lazarus `backup/` directories are excluded; other supported
+languages in directories with that name remain indexable.
+
 ## Infrastructure Topology
 
 Extract service topology from Kustomize, Helm, and Terraform files. This script requires `PyYAML` (`pip3 install pyyaml`).

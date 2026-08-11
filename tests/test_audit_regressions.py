@@ -433,6 +433,9 @@ class AuditRegressionTest(unittest.TestCase):
         self.assertEqual(
             build_belief_map.detect_source_language("module.tsx"), "typescript"
         )
+        self.assertEqual(
+            build_belief_map.detect_source_language("module.pas"), "pascal"
+        )
         self.assertIsNone(build_belief_map.detect_source_language("module.swift"))
         self.assertIsNone(build_belief_map.detect_source_language("bootstrap.sh"))
 
