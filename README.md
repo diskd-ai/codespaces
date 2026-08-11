@@ -65,6 +65,22 @@ Build an architecture map for an explicit project directory:
 python3 scripts/build_belief_map.py --root /absolute/path/to/project
 ```
 
+Exclude tracked source snapshots or generated fixture trees by directory name.
+The option is repeatable and applies at any depth:
+
+```bash
+python3 scripts/build_belief_map.py \
+  --root /absolute/path/to/project \
+  --exclude-dir review-bundles \
+  --exclude-dir generated-fixtures
+```
+
+When the target is inside a Git worktree, the builder also honors repository
+ignore rules through Git itself. This applies to source files and language
+configuration such as `tsconfig.json`, `package.json`, `Cargo.toml`, `go.mod`,
+and LSP project discovery. Tracked snapshot paths that still match
+`.gitignore` are excluded as well.
+
 Parser packages are loaded only for languages found in that project. Python
 needs no extra parser package. If another detected language is not installed,
 the builder stops before publishing and prints its exact install command, for

@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from ..interface import FileResult
+from ..discovery import is_excluded_directory, is_excluded_path
+from ..interface import DiscoveryExclusions, FileResult
 
 
 _SOURCE_SUFFIXES = (".rb", ".rake")
@@ -20,10 +21,7 @@ _QUOTED_SEGMENT_PATTERN = re.compile(r"['\"]([^'\"]+)['\"]")
 
 
 def _freeze_index(index: dict[str, set[str]]) -> dict[str, tuple[str, ...]]:
-    return {
-        name: tuple(sorted(targets))
-        for name, targets in index.items()
-    }
+    return {name: tuple(sorted(targets)) for name, targets in index.items()}
 
 
 def _read_source(path: Path, label: str) -> str:
@@ -37,25 +35,34 @@ def _read_source(path: Path, label: str) -> str:
         return ""
 
 
-def _project_acronyms(root: Path) -> dict[str, str]:
+def _project_acronyms(
+    root: Path,
+    discovery_exclusions: DiscoveryExclusions,
+) -> dict[str, str]:
     inflections_path = root / "config" / "initializers" / "inflections.rb"
-    if not inflections_path.is_file():
+    if (
+        is_excluded_path(discovery_exclusions, str(inflections_path))
+        or not inflections_path.is_file()
+    ):
         return {}
     content = _read_source(inflections_path, "inflections")
-    return {
-        acronym.lower(): acronym
-        for acronym in _ACRONYM_PATTERN.findall(content)
-    }
+    return {acronym.lower(): acronym for acronym in _ACRONYM_PATTERN.findall(content)}
 
 
-def _custom_autoload_roots(root: Path) -> tuple[Path, ...]:
+def _custom_autoload_roots(
+    root: Path,
+    discovery_exclusions: DiscoveryExclusions,
+) -> tuple[Path, ...]:
     config_paths = (
         root / "config" / "application.rb",
         root / "config" / "environment.rb",
     )
     roots: set[Path] = set()
     for config_path in config_paths:
-        if not config_path.is_file():
+        if (
+            is_excluded_path(discovery_exclusions, str(config_path))
+            or not config_path.is_file()
+        ):
             continue
         content = _read_source(config_path, "autoload configuration")
         for match in _AUTOLOAD_JOIN_PATTERN.finditer(content):
@@ -63,15 +70,22 @@ def _custom_autoload_roots(root: Path) -> tuple[Path, ...]:
             if not segments:
                 continue
             candidate = root.joinpath(*segments).resolve()
-            if candidate.is_dir() and _is_within(candidate, root):
+            if (
+                candidate.is_dir()
+                and _is_within(candidate, root)
+                and not is_excluded_path(discovery_exclusions, str(candidate))
+            ):
                 roots.add(candidate)
     return tuple(sorted(roots))
 
 
-def _default_autoload_roots(root: Path) -> tuple[Path, ...]:
-    roots: set[Path] = set(_custom_autoload_roots(root))
+def _default_autoload_roots(
+    root: Path,
+    discovery_exclusions: DiscoveryExclusions,
+) -> tuple[Path, ...]:
+    roots: set[Path] = set(_custom_autoload_roots(root, discovery_exclusions))
     app_root = root / "app"
-    if app_root.is_dir():
+    if app_root.is_dir() and not is_excluded_path(discovery_exclusions, str(app_root)):
         try:
             app_children = tuple(app_root.iterdir())
         except OSError as error:
@@ -81,21 +95,35 @@ def _default_autoload_roots(root: Path) -> tuple[Path, ...]:
             )
             app_children = ()
         for child in app_children:
-            if not child.is_dir():
+            if not child.is_dir() or is_excluded_directory(
+                discovery_exclusions,
+                str(app_root),
+                child.name,
+            ):
                 continue
             roots.add(child.resolve())
             concerns = child / "concerns"
-            if concerns.is_dir():
+            if concerns.is_dir() and not is_excluded_directory(
+                discovery_exclusions,
+                str(child),
+                concerns.name,
+            ):
                 roots.add(concerns.resolve())
     lib_root = root / "lib"
-    if lib_root.is_dir():
+    if lib_root.is_dir() and not is_excluded_directory(
+        discovery_exclusions,
+        str(root),
+        lib_root.name,
+    ):
         roots.add(lib_root.resolve())
     return tuple(sorted(roots, key=lambda path: (-len(path.parts), str(path))))
 
 
 def _camelize(segment: str, acronyms: Mapping[str, str]) -> str:
     parts = [part for part in segment.split("_") if part]
-    return "".join(acronyms.get(part.lower(), part[:1].upper() + part[1:]) for part in parts)
+    return "".join(
+        acronyms.get(part.lower(), part[:1].upper() + part[1:]) for part in parts
+    )
 
 
 def _expected_constant(
@@ -114,9 +142,7 @@ def _expected_constant(
                 without_suffix = relative.with_name(relative.name[: -len(suffix)])
                 break
         return "::".join(
-            _camelize(part, acronyms)
-            for part in without_suffix.parts
-            if part
+            _camelize(part, acronyms) for part in without_suffix.parts if part
         )
     return ""
 
@@ -130,7 +156,9 @@ def _source_namespaces(constants: tuple[str, ...], expected: str) -> tuple[str, 
             current, separator, _ = current.rpartition("::")
             if not separator:
                 break
-    return tuple(sorted(candidates, key=lambda name: (-name.count("::"), -len(name), name)))
+    return tuple(
+        sorted(candidates, key=lambda name: (-name.count("::"), -len(name), name))
+    )
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -198,18 +226,19 @@ class BoundRubyLanguage:
         cls,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundRubyLanguage:
-        del skip_directories
         from .parser import ruby_declarations
 
         root_path = Path(root).resolve()
         normalized_paths = {
-            str(Path(path).resolve()): node_id
-            for path, node_id in path_to_id.items()
+            str(Path(path).resolve()): node_id for path, node_id in path_to_id.items()
         }
-        acronyms = _project_acronyms(root_path)
-        autoload_roots = _default_autoload_roots(root_path)
+        acronyms = _project_acronyms(root_path, discovery_exclusions)
+        autoload_roots = _default_autoload_roots(
+            root_path,
+            discovery_exclusions,
+        )
         constant_index: dict[str, set[str]] = {}
         namespaces: dict[str, tuple[str, ...]] = {}
         raw_bases: dict[str, tuple[str, ...]] = {}
@@ -227,9 +256,7 @@ class BoundRubyLanguage:
                 constant_index.setdefault(expected, set()).add(node_id)
             namespaces[raw_path] = _source_namespaces(declarations, expected)
             raw_bases[raw_path] = tuple(
-                base
-                for bases in declared_bases.values()
-                for base in bases
+                base for bases in declared_bases.values() for base in bases
             )
 
         frozen_constant_index = _freeze_index(constant_index)
@@ -313,9 +340,7 @@ class BoundRubyLanguage:
                 source_path,
             )
         if import_name.startswith("ruby-require:"):
-            return self._resolve_require(
-                import_name.removeprefix("ruby-require:")
-            )
+            return self._resolve_require(import_name.removeprefix("ruby-require:"))
         if import_name.startswith("ruby-association-one:"):
             constant = _camelize(
                 import_name.removeprefix("ruby-association-one:"),

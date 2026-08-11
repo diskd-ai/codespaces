@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult, LanguageDependency
+from ..interface import (
+    BoundLanguage,
+    DiscoveryExclusions,
+    FileResult,
+    LanguageDependency,
+)
 from .imports import BoundGoLanguage
 
 
@@ -53,12 +58,12 @@ class GoLanguage:
         self,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundLanguage:
         return BoundGoLanguage.create(
             root,
             path_to_id,
-            skip_directories,
+            discovery_exclusions,
         )
 
     def normalize_module_id(self, relative_path: str) -> str:

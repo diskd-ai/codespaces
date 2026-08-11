@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult, LanguageDependency
+from ..interface import (
+    BoundLanguage,
+    DiscoveryExclusions,
+    FileResult,
+    LanguageDependency,
+)
 from .imports import BoundJavaLanguage
 
 
@@ -57,8 +62,9 @@ class JavaLanguage:
         self,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundLanguage:
+        del discovery_exclusions
         return BoundJavaLanguage.create(path_to_id)
 
     def normalize_module_id(self, relative_path: str) -> str:

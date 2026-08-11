@@ -95,6 +95,14 @@ class FileResult:
 
 
 @dataclass(frozen=True)
+class DiscoveryExclusions:
+    """Immutable exclusions shared by every source/configuration walk."""
+
+    directory_names: frozenset[str]
+    paths: frozenset[str]
+
+
+@dataclass(frozen=True)
 class LanguageDependency:
     """One exact runtime package required by a language parser."""
 
@@ -173,7 +181,7 @@ class Language(Protocol):
         self,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundLanguage:
         """Bind import resolution to one repository graph."""
         ...

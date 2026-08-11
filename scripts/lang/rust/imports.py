@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from ..interface import FileResult
+from ..discovery import is_excluded_path, retained_directory_names
+from ..interface import DiscoveryExclusions, FileResult
 
 
 @dataclass(frozen=True)
@@ -31,17 +32,21 @@ def _is_within(path: str, directory: str) -> bool:
 
 def _load_rust_packages(
     root: str,
-    skip_directories: frozenset[str],
+    discovery_exclusions: DiscoveryExclusions,
 ) -> tuple[RustPackage, ...]:
     packages: list[RustPackage] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            directory for directory in dirnames if directory not in skip_directories
-        ]
+        dirnames[:] = retained_directory_names(
+            discovery_exclusions,
+            dirpath,
+            dirnames,
+        )
         if "Cargo.toml" not in filenames:
             continue
 
         manifest_path = os.path.join(dirpath, "Cargo.toml")
+        if is_excluded_path(discovery_exclusions, manifest_path):
+            continue
         try:
             with open(manifest_path, "rb") as manifest_file:
                 manifest = tomllib.load(manifest_file)
@@ -157,9 +162,9 @@ class BoundRustLanguage:
         cls,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundRustLanguage:
-        packages = _load_rust_packages(root, skip_directories)
+        packages = _load_rust_packages(root, discovery_exclusions)
         if packages:
             print(
                 f"[belief-map] Loaded {len(packages)} local Rust packages",

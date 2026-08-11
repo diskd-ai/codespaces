@@ -4,6 +4,7 @@ from .csharp import CSHARP_LANGUAGE
 from .go import GO_LANGUAGE
 from .interface import (
     BoundLanguage,
+    DiscoveryExclusions,
     Entity,
     FileResult,
     ImportedName,
@@ -57,6 +58,7 @@ def language_for_result(result_language: str) -> Language:
 
 __all__ = [
     "BoundLanguage",
+    "DiscoveryExclusions",
     "Entity",
     "FileResult",
     "ImportedName",

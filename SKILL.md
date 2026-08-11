@@ -249,7 +249,21 @@ python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --full
 python3 "$SKILL_ROOT/scripts/build_belief_map.py" --root "$TARGET_ROOT" --lsp
 python3 "$SKILL_ROOT/scripts/build_belief_map.py" \
   --root "$TARGET_ROOT" --output "$TARGET_ROOT/custom-map.sexp"
+python3 "$SKILL_ROOT/scripts/build_belief_map.py" \
+  --root "$TARGET_ROOT" --exclude-dir review-bundles
 ```
+
+Use repeatable `--exclude-dir NAME` options for tracked snapshots, generated
+fixtures, or other source-shaped trees that are not part of the live product.
+Each value is a directory basename and applies at any depth. Changing exclusions
+invalidates the incremental cache so excluded files cannot leak from an earlier
+build.
+
+Targets inside Git worktrees also use Git's repository ignore rules. The same
+resolved policy filters source files, TypeScript aliases and packages, Go and
+Rust package manifests, Ruby project configuration, and LSP project discovery.
+Git is invoked with index checks disabled so tracked snapshot paths that match
+`.gitignore` remain excluded from the belief map.
 
 Rebuild after structural changes (add/remove files, change imports, add classes).
 Search patterns support literals, `.*`, boundary `^`/`$` anchors, and

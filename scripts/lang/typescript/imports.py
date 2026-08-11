@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional
 
-from ..interface import FileResult
+from ..discovery import (
+    is_excluded_path,
+    retained_directory_names,
+)
+from ..interface import DiscoveryExclusions, FileResult
 
 
 @dataclass(frozen=True)
@@ -35,21 +39,27 @@ class TsPackage:
     directory: str
 
 
-def _load_ts_path_aliases(root: str) -> tuple[TsPathAliasContext, ...]:
+def _load_ts_path_aliases(
+    root: str,
+    discovery_exclusions: DiscoveryExclusions,
+) -> tuple[TsPathAliasContext, ...]:
     """Load validated path mappings without merging independent projects."""
     import json as _json
 
     contexts: list[TsPathAliasContext] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in ("node_modules", ".git", "dist", "build", ".next", ".cache")
-        ]
+        dirnames[:] = retained_directory_names(
+            discovery_exclusions,
+            dirpath,
+            dirnames,
+        )
         for fname in filenames:
             if fname != "tsconfig.json":
                 continue
 
             tsconfig_path = os.path.join(dirpath, fname)
+            if is_excluded_path(discovery_exclusions, tsconfig_path):
+                continue
             try:
                 with open(tsconfig_path, "r", encoding="utf-8") as file:
                     raw = file.read()
@@ -91,32 +101,46 @@ def _load_ts_path_aliases(root: str) -> tuple[TsPathAliasContext, ...]:
                     aliases.append(TsPathAlias(alias_pattern, target_patterns))
 
             if aliases:
-                contexts.append(TsPathAliasContext(
-                    config_directory=os.path.normpath(dirpath),
-                    aliases=tuple(sorted(aliases, key=lambda alias: len(alias.pattern), reverse=True)),
-                ))
+                contexts.append(
+                    TsPathAliasContext(
+                        config_directory=os.path.normpath(dirpath),
+                        aliases=tuple(
+                            sorted(
+                                aliases,
+                                key=lambda alias: len(alias.pattern),
+                                reverse=True,
+                            )
+                        ),
+                    )
+                )
 
-    return tuple(sorted(
-        contexts,
-        key=lambda context: len(Path(context.config_directory).parts),
-        reverse=True,
-    ))
+    return tuple(
+        sorted(
+            contexts,
+            key=lambda context: len(Path(context.config_directory).parts),
+            reverse=True,
+        )
+    )
 
 
 def _load_ts_packages(
     root: str,
-    skip_directories: frozenset[str],
+    discovery_exclusions: DiscoveryExclusions,
 ) -> tuple[TsPackage, ...]:
     """Load local package identities used by workspace self-imports."""
     packages: list[TsPackage] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [
-            directory for directory in dirnames if directory not in skip_directories
-        ]
+        dirnames[:] = retained_directory_names(
+            discovery_exclusions,
+            dirpath,
+            dirnames,
+        )
         if "package.json" not in filenames:
             continue
 
         package_path = os.path.join(dirpath, "package.json")
+        if is_excluded_path(discovery_exclusions, package_path):
+            continue
         try:
             with open(package_path, "r", encoding="utf-8") as file:
                 data = json.load(file)
@@ -140,7 +164,7 @@ def _typescript_resolution_bases(resolved: str) -> tuple[str, ...]:
     """Map emitted JavaScript specifiers back to their TypeScript source base."""
     for suffix in (".jsx", ".mjs", ".cjs", ".js"):
         if resolved.endswith(suffix):
-            return (resolved[:-len(suffix)], resolved)
+            return (resolved[: -len(suffix)], resolved)
     return (resolved,)
 
 
@@ -185,7 +209,7 @@ def _match_ts_alias(pattern: str, imp: str) -> Optional[str]:
     if not imp.startswith(prefix) or not imp.endswith(suffix):
         return None
     remainder_end = len(imp) - len(suffix) if suffix else len(imp)
-    return imp[len(prefix):remainder_end]
+    return imp[len(prefix) : remainder_end]
 
 
 def _resolve_ts_path_alias(
@@ -263,15 +287,15 @@ class BoundTypeScriptLanguage:
         cls,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundTypeScriptLanguage:
-        alias_contexts = _load_ts_path_aliases(root)
+        alias_contexts = _load_ts_path_aliases(root, discovery_exclusions)
         if alias_contexts:
             print(
                 f"[belief-map] Loaded {len(alias_contexts)} TS alias contexts",
                 file=sys.stderr,
             )
-        packages = _load_ts_packages(root, skip_directories)
+        packages = _load_ts_packages(root, discovery_exclusions)
         if packages:
             print(
                 f"[belief-map] Loaded {len(packages)} local TS packages",

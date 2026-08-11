@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from ..interface import BoundLanguage, FileResult, LanguageDependency
+from ..interface import (
+    BoundLanguage,
+    DiscoveryExclusions,
+    FileResult,
+    LanguageDependency,
+)
 from .imports import BoundRubyLanguage
 
 
@@ -42,9 +47,7 @@ class RubyLanguage:
         return file_name.endswith(self.source_extensions)
 
     def accepts_project_config(self, file_name: str) -> bool:
-        return file_name in self.project_config_names or file_name.endswith(
-            ".gemspec"
-        )
+        return file_name in self.project_config_names or file_name.endswith(".gemspec")
 
     def parse(
         self,
@@ -59,21 +62,19 @@ class RubyLanguage:
         self,
         root: str,
         path_to_id: Mapping[str, str],
-        skip_directories: frozenset[str],
+        discovery_exclusions: DiscoveryExclusions,
     ) -> BoundLanguage:
         return BoundRubyLanguage.create(
             root,
             path_to_id,
-            skip_directories,
+            discovery_exclusions,
         )
 
     def normalize_module_id(self, relative_path: str) -> str:
         for extension in self.source_extensions:
             if relative_path.endswith(extension):
                 return relative_path[: -len(extension)]
-        raise ValueError(
-            f"Ruby module path must end in .rb or .rake: {relative_path}"
-        )
+        raise ValueError(f"Ruby module path must end in .rb or .rake: {relative_path}")
 
     def output_language_code(self, result_language: str) -> str:
         if result_language != "ruby":
