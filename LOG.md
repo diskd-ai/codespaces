@@ -3,6 +3,11 @@
 ## 2026-08-11
 
 ### Changes
+- Added dependency-free Free Pascal and Lazarus language support for source
+  discovery, structural parsing, module identity, import resolution, search,
+  and boundary analysis.
+- Added focused regressions for Pascal dependency isolation, resolver errors,
+  source-path restoration, and public `analyze`/`boundary` output.
 - Added one immutable discovery-exclusion contract shared by source,
   language-configuration, package, and LSP project discovery.
 - Added repository-owned `.gitignore` resolution through Git with tracked-path
@@ -12,12 +17,18 @@
   discovery, tracked ignored snapshots, and cache provenance.
 
 ### Fixes
+- Surfaced Pascal resolver read failures instead of silently publishing partial
+  import and type indexes.
+- Normalized temporary discovery roots so Pascal backup-directory coverage is
+  portable across macOS path aliases.
 - Removed TypeScript alias discovery's private skip list so it consumes the
   same policy as every other target-root walk.
 - Prevented POSIX and Windows path forms from entering the basename-only public
   CLI contract.
 
 ### Motivation
+- Extend architecture discovery to Free Pascal and Lazarus repositories while
+  preserving fail-closed resolution and language-scoped dependency loading.
 - Keep tracked snapshots and repository-ignored source-shaped artifacts out of
   search, reverse-dependency, and architecture-violation results without
   duplicating Git ignore semantics.

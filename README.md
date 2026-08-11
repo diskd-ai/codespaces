@@ -1,7 +1,8 @@
 # Codespaces - Code Search, Dependency Graphs, and Impact Analysis
 
 > Architecture-aware code search, dependency graphs, and impact analysis for
-> Python, TypeScript, Rust, C#, Java, Go, Ruby, Rails, for AI coding agents.
+> Python, TypeScript, Rust, C#, Java, Go, Ruby, Rails, Free Pascal, and Lazarus,
+> for AI coding agents.
 >
 > **Install:** `npx skills add diskd-ai/codespaces` | [skills.sh](https://skills.sh)
 >
@@ -9,9 +10,9 @@
 
 Understand a large codebase before you change it. Codespaces is an
 architecture-aware code search tool for Python, TypeScript, TSX, Rust, C#,
-Java, Go, Ruby, and Ruby on Rails repositories. It helps developers and AI
-coding agents find the right module, trace dependencies, measure change impact,
-and read only the source files that matter.
+Java, Go, Ruby, Ruby on Rails, Free Pascal, and Lazarus repositories. It helps
+developers and AI coding agents find the right module, trace dependencies,
+measure change impact, and read only the source files that matter.
 
 Use it for codebase architecture discovery, dependency graph search, blast-radius
 analysis, call-flow tracing, monorepo navigation, and safer AI-assisted coding.
@@ -141,12 +142,20 @@ is outside the current directory.
 | Java | Packages, imports, classes, interfaces, records, enums, methods, annotations, inheritance, and local type dependencies |
 | Go | Modules, packages, imports, structs, interfaces, functions, constants, variables, receiver methods, and local package dependencies |
 | Ruby and Rails | Ruby classes, modules, instance and singleton methods, inheritance, requires, Zeitwerk constants, concerns, associations, callbacks, jobs, mailers, and impacted specs |
+| Free Pascal and Lazarus | Units, programs, uses/includes, classes, records, interfaces, inheritance, methods, and routines |
 
 Codespaces is designed for single repositories and monorepos. It understands
 Python project roots, TypeScript configuration and package aliases, Cargo package
 names and local Rust crate dependencies, .NET solutions and projects, Maven and
 Gradle projects, Go modules and workspaces, and Rails application/autoload
 roots with project acronyms.
+
+Pascal dependencies resolve by case-insensitive unit identity and explicit
+`UnitName in 'path.pas'` paths, then by a unique same-directory unit. Other
+ambiguous unit names remain unlinked, compiler conditionals are indexed
+conservatively, and Pascal does not use LSP enrichment. Automatic Pascal copies
+under Lazarus `backup/` directories are excluded without excluding other
+supported languages stored under the same path.
 
 It can also map infrastructure relationships from Kustomize, Helm, and Terraform.
 
