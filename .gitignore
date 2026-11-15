@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Generated belief-map artifacts (produced by scripts/build_belief_map.py)
+.belief_map.sexp
+.belief_map_cache.json
