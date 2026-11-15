@@ -70,7 +70,7 @@ explicit `search` -> `analyze` flow below.
 python3 scripts/belief_search.py search "keyword"
 python3 scripts/belief_search.py entity EntityName
 ```
-Use `search` or `entity` to locate the module ID. Module IDs are **full relative paths** like `pki-service/src/modules/ca/ca.service`, not short codes like `ps34`. The belief map may contain short path-map IDs internally, but they are resolved automatically -- always pass human-readable path-like strings. Do NOT guess or invent module IDs -- always confirm with `search` first.
+Use `search` or `entity` to locate the module ID. Module IDs are **full relative paths** like `billing-service/src/modules/invoice/invoice.service`, not short codes like `bs34`. The belief map may contain short path-map IDs internally, but they are resolved automatically -- always pass human-readable path-like strings. Do NOT guess or invent module IDs -- always confirm with `search` first.
 
 **Step 2 -- Analyze the module (do this IMMEDIATELY, not optionally):**
 ```bash
@@ -222,18 +222,18 @@ If a command returns `(error no-match ...)`:
 
 ```bash
 # Wrong: guessing IDs
-python3 scripts/belief_search.py analyze ps34        # fails: ps34 is a short path-map ID
-python3 scripts/belief_search.py analyze ca.service  # fails: incomplete path
+python3 scripts/belief_search.py analyze bs34        # fails: bs34 is a short path-map ID
+python3 scripts/belief_search.py analyze invoice.service  # fails: incomplete path
 
 # Right: search first, then use the full path from results
-python3 scripts/belief_search.py search "ca.*service"
-# Output shows: pki-service/src/modules/ca/ca.service
-python3 scripts/belief_search.py analyze pki-service/src/modules/ca/ca.service
+python3 scripts/belief_search.py search "invoice.*service"
+# Output shows: billing-service/src/modules/invoice/invoice.service
+python3 scripts/belief_search.py analyze billing-service/src/modules/invoice/invoice.service
 ```
 
 ## Anti-patterns
 
-- **Guessing module IDs.** Module IDs are full relative paths (e.g., `pki-service/src/modules/ca/ca.service`). Short codes like `ps34` are internal path-map IDs and must not be used directly. Always `search` first.
+- **Guessing module IDs.** Module IDs are full relative paths (e.g., `billing-service/src/modules/invoice/invoice.service`). Short codes like `bs34` are internal path-map IDs and must not be used directly. Always `search` first.
 - **Build but never query.** Building the belief map and then never running `search`, `analyze`, or `boundary` provides zero value.
 - **Querying after reading source.** The first source-code read should come from `boundary-file` lines in `analyze` output.
 - **Reading `.belief_map.sexp` as a whole file.** Use `search`, `analyze`, or `rg` to query specific facts.

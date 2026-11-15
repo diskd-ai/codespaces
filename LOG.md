@@ -1,5 +1,11 @@
 # Completion Log
 
+## 2026-11-15
+
+### Changes
+- Documentation: `SKILL.md` examples use a generic billing/invoice module
+  path; verification notes in this log describe targets by language and kind.
+
 ## 2026-08-11
 
 ### Changes
@@ -90,11 +96,12 @@
 - Verified Rust support against `diskd-cli`: all 4 tracked Rust files were
   discovered, all 256 source-oracle entities matched, and both local crate
   dependency edges matched, with 100% precision and recall.
-- Verified C# on `avsync-api-core`: 254/254 authored files, 286/286 entities,
+- Verified C# on a private API codebase: 254/254 authored files, 286/286
+  entities,
   and 728/728 source-derived local import edges matched with no parse errors.
-- Verified Java on `nextnet-tangerine-service`: 28/28 files, 28/28 entities,
+- Verified Java on a private service codebase: 28/28 files, 28/28 entities,
   and 46/46 source-derived local import edges matched with no parse errors.
-- Verified Go on the Avionica `go-gobwas` target: 1/1 file and 14/14 entities
+- Verified Go on a private single-file target: 1/1 file and 14/14 entities
   matched with no parse errors; its source has no local package-import recall
   denominator, so a focused multi-package fixture verified both expected local
   package edges instead.
