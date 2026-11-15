@@ -1,3 +1,8 @@
+> [!WARNING]
+> **This repository is deprecated.** The project has moved to
+> [aileron-tech/wingbox](https://github.com/aileron-tech/wingbox) and continues
+> there. This copy is no longer maintained.
+
 # Codespaces - Code Search, Dependency Graphs, and Impact Analysis
 
 > Architecture-aware code search, dependency graphs, and impact analysis for
